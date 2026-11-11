@@ -4,7 +4,9 @@ Sources :
   - history/*.json  : jours passés extraits des Excel ({date, etfs: {SYM: {"HH:MM": [vol, churn, carnet, trades]}}})
   - live_refs.json  : jours accumulés par le bot lui-même (même contenu, tableau de 288 slots par ETF)
 
-Pour un jour J, seules les séances STRICTEMENT AVANT J servent (comme _hist_baseline du script Excel).
+Pour un jour J, seules les WINDOW_DAYS séances les plus récentes STRICTEMENT AVANT J servent
+(comme _hist_baseline du script Excel, avec fenêtre glissante : chaque nouveau jour remplace
+le plus ancien — les jours live hors fenêtre sont supprimés de live_refs.json).
 Références par ETF et par slot (288 slots de 5 min) :
   vol   : médiane du volume par slot sur >= 3 jours, lissée (moyenne slot ±1), plancher 10 % de la moyenne  -> BA / colonne D
   churn : médiane du churn (quotes/min) par slot, lissée (médiane ±1), plancher 10 % de la moyenne         -> EQ / colonne E
@@ -28,6 +30,10 @@ REF_SMOOTH = 1
 REF_FLOOR_FRAC = 0.10                   # planchers identiques au script Excel
 CHURN_REF_FLOOR_FRAC = 0.10
 TAPE_REF_FLOOR_FRAC = 0.10
+
+# Fenêtre glissante d'historique : chaque nouveau jour remplace le plus ancien.
+# Ajustable via la variable d'environnement REFS_WINDOW_DAYS (défaut : 25 séances).
+WINDOW_DAYS = int(os.environ.get("REFS_WINDOW_DAYS", "25"))
 
 _FIN = float("inf")
 
@@ -87,6 +93,7 @@ class RefBook:
         self.history_dir = Path(history_dir)
         self.live_file = Path(live_file or os.environ.get("REFS_FILE", "live_refs.json"))
         self.days: dict[str, dict[str, list]] = {}     # date -> {etf: [[vol, churn, trades] x SLOTS]}
+        self.git_days: set[str] = set()                # jours venant de history/ (lecture seule)
         self._load_history()
         self._load_live()
         self.today: str | None = None
@@ -112,6 +119,7 @@ class RefBook:
                         if 0 <= s < SLOTS and isinstance(v, (list, tuple)) and len(v) >= 4:
                             arr[e][s] = [v[0], v[1], v[3]]          # vol, churn, trades (carnet inutile ici)
                 self.days[day] = arr
+                self.git_days.add(day)
             except Exception as ex:      # noqa: BLE001
                 print(f"[!] référence ignorée {p} : {ex}")
 
@@ -125,15 +133,24 @@ class RefBook:
         except Exception as ex:          # noqa: BLE001
             print(f"[!] {self.live_file} illisible : {ex}")
 
+    def _keep_days(self) -> set[str]:
+        """Les WINDOW_DAYS séances les plus récentes (toutes sources confondues)."""
+        return set(sorted(self.days)[-WINDOW_DAYS:])
+
     def save(self):
+        # on ne persiste que les jours accumulés en live (history/ est déjà sur git),
+        # et uniquement ceux encore dans la fenêtre : le plus ancien est écrasé.
+        keep = self._keep_days()
+        days = {d: v for d, v in self.days.items() if d not in self.git_days and d in keep}
         tmp = self.live_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"days": self.days}))
+        tmp.write_text(json.dumps({"days": days}))
         os.replace(tmp, self.live_file)
 
     # ---------------------------------------------------------- références d'un jour
     def baselines(self, day: str) -> dict:
-        """{etf: {"vol": [288], "churn": [288]|None, "tape": [288]|None}} calculé sur les séances < day."""
-        past = sorted(d for d in self.days if d < day)
+        """{etf: {"vol": [288], "churn": [288]|None, "tape": [288]|None}} calculé sur les WINDOW_DAYS
+        séances les plus récentes STRICTEMENT AVANT day (fenêtre glissante)."""
+        past = [d for d in sorted(x for x in self.days if x < day)[-WINDOW_DAYS:]]
         out = {}
         for e in ETFS:
             mats = [self.days[d][e] for d in past if e in self.days[d]]
@@ -147,6 +164,7 @@ class RefBook:
         if day not in self.days:
             self.days[day] = self._blank_day()
         self.today = day
+        self.save()                     # applique la fenêtre : le jour le plus ancien sort de live_refs.json
 
     def record_bar(self, slot: int, per_etf):
         """per_etf : {etf: (volume, nb_quotes, nb_trades)} de la bougie close."""
