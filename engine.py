@@ -24,8 +24,8 @@ BAR_MINUTES = 5                    # CL = trades / 5 dans les feuilles ETF
 # --- constantes lues dans les formules ---
 CVD_HALF_LIFE_I = 45               # colonne I : demi-vie en minutes
 CVD_HALF_LIFE_J = 30               # colonne J : demi-vie en minutes
-CVD_DECAY_I = 0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_I)   # = 0.925875 pour des bougies de 5 min
-CVD_DECAY_J = 0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_J)   # = 0.890899 pour des bougies de 5 min
+CVD_DECAY_I = round(0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_I), 6)   # = 0.925875 (Excel arrondit à 6 décimales)
+CVD_DECAY_J = round(0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_J), 6)   # = 0.890899 (Excel arrondit à 6 décimales)
 WIN = 60                           # fenêtre glissante de 60 bougies (J, AW, JR)
 WC_CAP = 0.4                       # plafond de poids : 40 % (3 itérations, HP/HQ/HR)
 MIN_TRADES_WIN = 20                # KP : au moins 20 trades sur 60 bougies
