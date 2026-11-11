@@ -4,21 +4,23 @@ Alimentée bougie après bougie par les sorties de engine.py (replay.py pour le 
 live.py en temps réel via le hook `on_bar`). Chaque bougie i n'utilise que les valeurs
 des bougies <= i : aucune donnée future.
 
-RÈGLES VALIDÉES (12/11) :
+RÈGLES VALIDÉES (mises à jour) :
   - « delta » = colonnes G, K, L, O, P. Un delta est « dans le sens » s'il est strictement
     du signe de la direction ; une case vide (None) compte comme « pas dans le sens ».
   - Mode 1 : déclencheur max(D,E,F) >= 1,8 avec I signé (0/vide = pas de déclencheur) ;
     direction = signe de I ; fenêtre 3 bougies ; annulation UNIQUEMENT si I change de signe
     (I = 0 ou vide N'annule PAS) ; un nouveau déclencheur remplace l'attente ;
     confirmation = >= 2 deltas dans le sens + J dans le sens sur une même bougie suivante.
-  - Mode 2 « Vito » : M >= +0,20 long / M <= -0,20 short ; fenêtre 4 bougies ; I ignorée ;
+  - Mode 2 « Vito » : M >= +0,15 long / M <= -0,15 short ; fenêtre 4 bougies ; I ignorée ;
     nouveaux déclencheurs ignorés pendant l'attente ;
     confirmation = >= 2 deltas dans le sens + J >= 0,05 dans le sens.
   - Ordre sur une bougie : 1) l'attente existante est évaluée (annulation, puis confirmation),
     2) ensuite seulement la bougie peut déclencher une nouvelle attente.
   - La bougie déclencheuse n'est jamais sa propre confirmation.
-  - Session : déclenchement et confirmation uniquement de 9h30 à 15h55 NY (début de bougie).
-  - Pas de cooldown entre deux alertes confirmées. État réinitialisé à chaque nouveau jour NY.
+  - Session : déclenchement et confirmation uniquement de 9h30 à 14h00 NY (début de bougie).
+  - Max 2 alertes confirmées par mode et par séance ; pas de cooldown entre elles.
+    Une fois le max atteint, le mode ne déclenche plus rien jusqu'au lendemain.
+  - État réinitialisé à chaque nouveau jour NY.
 
 Envoi Telegram (hook live) : variables d'environnement
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  -> si absentes, les événements sont seulement logués.
@@ -40,11 +42,12 @@ log = logging.getLogger("alerts")
 
 CONFIG = {
     "session_start": 9 * 60 + 30,      # minutes NY depuis minuit
-    "session_end": 15 * 60 + 55,       # dernière bougie (début 15h55)
+    "session_end": 14 * 60,            # 14h00 NY max (début de bougie) ; 13*60+55 pour exclure 14h00
+    "max_alerts": 2,                   # alertes confirmées max par mode et par séance
     "delta_cols": ("G", "K", "L", "O", "P"),
     "min_deltas": 2,
     "m1": {"trigger_cols": ("D", "E", "F"), "trigger_min": 1.8, "window": 3},
-    "m2": {"trigger_m": 0.20, "window": 4, "j_min": 0.05},
+    "m2": {"trigger_m": 0.15, "window": 4, "j_min": 0.05},
 }
 
 
@@ -79,6 +82,8 @@ class AlertMachine:
     cfg: dict = field(default_factory=lambda: CONFIG)
     p1: Optional[_Pending] = None
     p2: Optional[_Pending] = None
+    n1: int = 0      # alertes M1 confirmées aujourd'hui
+    n2: int = 0      # alertes M2 confirmées aujourd'hui
 
     @staticmethod
     def _dir(d):
@@ -107,14 +112,15 @@ class AlertMachine:
                 p.left -= 1
                 if nd >= c["min_deltas"] and j_ok:
                     E("M1", "ALERT", p.d, f"déclencheur N°{p.trig_bar}")
+                    self.n1 += 1
                     self.p1 = None
                 elif p.left == 0:
                     E("M1", "EXPIRE", p.d, f"non confirmé ({nd} delta, J={out.get('J')}) (déclencheur N°{p.trig_bar})")
                     self.p1 = None
-        # Mode 1 : déclenchement
+        # Mode 1 : déclenchement (bloqué une fois le max d'alertes atteint)
         m1 = c["m1"]
         trig = [k for k in m1["trigger_cols"] if is_num(out.get(k)) and out[k] >= m1["trigger_min"]]
-        if trig and sgn(out.get("I")) != 0:
+        if trig and sgn(out.get("I")) != 0 and self.n1 < c["max_alerts"]:
             d = sgn(out["I"])
             if self.p1:
                 E("M1", "REPLACED", self.p1.d, f"remplacée par le déclencheur N°{bar_no}")
@@ -130,13 +136,14 @@ class AlertMachine:
             p.left -= 1
             if nd >= c["min_deltas"] and j_ok:
                 E("M2", "ALERT", p.d, f"déclencheur N°{p.trig_bar}")
+                self.n2 += 1
                 self.p2 = None
             elif p.left == 0:
                 E("M2", "EXPIRE", p.d, f"non confirmé ({nd} delta, J={out.get('J')}) (déclencheur N°{p.trig_bar})")
                 self.p2 = None
-        # Mode 2 : déclenchement (ignoré pendant l'attente)
+        # Mode 2 : déclenchement (ignoré pendant l'attente ; bloqué une fois le max atteint)
         m = out.get("M")
-        if is_num(m) and abs(m) >= m2["trigger_m"]:
+        if is_num(m) and abs(m) >= m2["trigger_m"] and self.n2 < c["max_alerts"]:
             d = sgn(m)
             if self.p2:
                 E("M2", "IGNORED", d, f"nouveau déclencheur ignoré (M={m:+.3f}), attente N°{self.p2.trig_bar} en cours")
@@ -207,7 +214,7 @@ class _LiveAlerts:
     def on_bar(self, ny_iso: str, out: dict, bars=None) -> List[Event]:
         dt = datetime.fromisoformat(ny_iso)
         day = dt.date().isoformat()
-        if day != self.day:                       # minuit NY : état ne se propage pas d'un jour à l'autre
+        if day != self.day:                       # minuit NY : état (dont compteurs n1/n2) remis à zéro
             self.day, self.machine = day, AlertMachine()
         minutes = dt.hour * 60 + dt.minute
         events = self.machine.push(minutes // 5 + 1, minutes, out)
