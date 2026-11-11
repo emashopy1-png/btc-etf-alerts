@@ -9,7 +9,7 @@ from openpyxl.utils import column_index_from_string as CI
 
 from alerts import AlertMachine
 from engine import ETFS, Engine
-from validate import ETF_COLS, FIRST, LAST, clean, minutes
+from validate import ETF_COLS, FIRST, LAST, clean, minutes, f_excluded_for
 
 
 def replay(path, feed="IEX"):
@@ -17,7 +17,7 @@ def replay(path, feed="IEX"):
     conf = wb[f"CONFLUENCE_{feed}"]
     etf = {s: wb[f"{s}_{feed}"] for s in ETFS}
     rows = {s: {c: [clean(etf[s].cell(r, CI(c)).value) for r in range(FIRST, LAST + 1)] for c in ETF_COLS} for s in ETFS}
-    eng, am = Engine(), AlertMachine()
+    eng, am = Engine(f_excluded=f_excluded_for(etf)), AlertMachine()
     events, series = [], []
     for k in range(LAST - FIRST + 1):
         r = FIRST + k
