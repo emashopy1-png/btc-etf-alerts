@@ -50,6 +50,11 @@ try:                           # hook optionnel (machine à états + Telegram)
 except Exception:              # noqa: BLE001
     alerts = None
 
+try:                           # exécution Bybit démo des alertes confirmées (EXEC_ENABLED=1)
+    import bybit_exec as executor  # type: ignore
+except Exception:              # noqa: BLE001
+    executor = None
+
 
 # ------------------------------------------------------------------------------------------------ utilitaires
 _FRAC = re.compile(r"(\.\d{6})\d+")
@@ -279,11 +284,17 @@ class Runner:
                 f.write(json.dumps(rec) + "\n")
         if not catchup:
             log.info("%s %s", dt.strftime("%H:%M"), {k: (round(v, 4) if is_num(v) else v) for k, v in out.items()})
+            events = []
             if alerts is not None:
                 try:
-                    alerts.on_bar(dt.isoformat(), out, bars)
+                    events = alerts.on_bar(dt.isoformat(), out, bars) or []
                 except Exception as ex:   # noqa: BLE001
                     log.warning("alerts.on_bar : %s", ex)
+            if events and executor is not None:
+                try:
+                    executor.on_events(events)
+                except Exception as ex:   # noqa: BLE001
+                    log.warning("bybit_exec.on_events : %s", ex)
         for h in self.hooks:
             h(b, bars, out)
 
