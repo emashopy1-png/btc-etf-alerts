@@ -188,6 +188,7 @@ class Runner:
         self.write_history = write_history
         self.bucket = None        # début de la bougie en cours
         self.first = None         # première bougie « réelle » (avant : rattrapage depuis minuit, sans alertes)
+        self.catchup_until = None # posé par backfill_today : tout ce qui est rejoué reste « catchup »
         self.day = None
         self.eng = None
         self.ba = {}              # etf -> [288] réf. volume (colonne BA)
@@ -272,10 +273,11 @@ class Runner:
         except Exception as ex:      # noqa: BLE001  (ne jamais tuer la boucle live)
             log.exception("push a échoué sur %s : %s", dt.isoformat(), ex)
             out = {k: eng.ERR for k in "DEFGHIJKLMNOP"}
-        self.refbook.record_bar(slot, {e: (bars[e]["I"], bars[e]["QN"], bars[e]["J"]) for e in ETFS})
-        if minutes % 60 == 0:
-            self.refbook.save()
-        catchup = b < (self.first or 0)
+        catchup = b < max(self.first or 0, self.catchup_until or 0)
+        if not catchup:                   # ne jamais enregistrer les bougies rejouées (double comptage)
+            self.refbook.record_bar(slot, {e: (bars[e]["I"], bars[e]["QN"], bars[e]["J"]) for e in ETFS})
+            if minutes % 60 == 0:
+                self.refbook.save()
         rec = {"t": dt.isoformat(), "out": out,
                "bars": {e: {k: bars[e][k] for k in ("H", "I", "J", "L", "M")} for e in ETFS if bars[e]["J"]}}
         if self.write_history and not catchup:
@@ -349,6 +351,86 @@ def _dispatch(runner, m):
         log.error("flux : %s", m)
 
 
+# ------------------------------------------------------------------------------------------------ rattrapage du jour (API historique)
+# Au (re)démarrage en cours de journée : rejoue trades + quotes depuis minuit NY pour reconstruire
+# H, I, J et les fenêtres internes du moteur comme si le bot tournait depuis minuit. Sans alertes
+# ni enregistrement dans les références (catchup). BACKFILL_TODAY=0 pour désactiver.
+BACKFILL_TODAY = os.environ.get("BACKFILL_TODAY", "1") == "1"
+REST_URL = "https://data.alpaca.markets"
+_PAGE = 10000
+
+
+def _rest_json(path, params, key, sec):
+    """GET data.alpaca.markets avec retries (réseau, 429)."""
+    import urllib.parse
+    import urllib.request
+    url = f"{REST_URL}{path}?{urllib.parse.urlencode(params)}"
+    wait = 1.0
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, headers={"APCA-API-KEY-ID": key,
+                                                       "APCA-API-SECRET-KEY": sec})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except Exception as ex:      # noqa: BLE001
+            if attempt == 4:
+                raise
+            log.warning("rattrapage %s : %s (retry dans %.0fs)", path, ex, wait)
+            time.sleep(wait)
+            wait = min(30.0, wait * 2)
+
+
+def _paged(path, d0, t1, feed, key, sec, field):
+    """Itérateur paresseux sur toutes les pages d'un endpoint historique (trades / quotes)."""
+    token = None
+    while True:
+        params = {"start": d0, "end": t1, "limit": _PAGE, "feed": feed, "sort": "asc"}
+        if token:
+            params["page_token"] = token
+        r = _rest_json(path, params, key, sec)
+        yield from (r.get(field) or [])
+        token = r.get("next_page_token")
+        if not token:
+            return
+        time.sleep(0.15)             # marge sous la limite Alpaca (200 req/min)
+
+
+def backfill_today(runner, feed):
+    """Rejoue le jour en cours depuis minuit NY. Les flux paginés des 12 ETF sont fusionnés par
+    heapq.merge : mémoire bornée (~1 page par flux) et ordre global chronologique respecté."""
+    import heapq
+    key, sec = os.environ["APCA_API_KEY_ID"], os.environ["APCA_API_SECRET_KEY"]
+    now = time.time()
+    t0 = ny_midnight(now)
+    if now - t0 < BAR:
+        return                                    # journée qui vient de commencer : rien à rejouer
+    d0 = datetime.fromtimestamp(t0, NY).isoformat(timespec="milliseconds")
+    t1 = datetime.fromtimestamp(now, NY).isoformat(timespec="milliseconds")
+
+    def trades(sym):
+        for m in _paged(f"/v2/stocks/{sym}/trades", d0, t1, feed, key, sec, "trades"):
+            yield (parse_ts(m["t"]), 0, sym, m)
+
+    def quotes(sym):
+        for m in _paged(f"/v2/stocks/{sym}/quotes", d0, t1, feed, key, sec, "quotes"):
+            yield (parse_ts(m["t"]), 1, sym, m)
+
+    runner.catchup_until = now                    # rejoué = pas d'alerte, pas de record (double comptage)
+    streams = [g for sym in ETFS for g in (trades(sym), quotes(sym))]
+    log.info("rattrapage du jour : téléchargement et rejeu depuis minuit NY...")
+    n = 0
+    for ts, kind, sym, m in heapq.merge(*streams, key=lambda e: e[0]):
+        if kind == 0:
+            runner.on_trade(sym, ts, float(m["p"]), float(m["s"]), m.get("c"))
+        else:
+            runner.on_quote(sym, ts, float(m.get("bs", 0)), float(m.get("as", 0)),
+                            float(m.get("bp", 1)), float(m.get("ap", 1)))
+        n += 1
+        if n % 500000 == 0:
+            log.info("rattrapage : %d événements rejoués...", n)
+    log.info("rattrapage terminé : %d événements depuis minuit NY", n)
+
+
 # ------------------------------------------------------------------------------------------------ replay / selftest
 def run_replay(runner, path):
     last = None
@@ -414,6 +496,12 @@ def main():
     if a.replay:
         run_replay(runner, a.replay)
     else:
+        if BACKFILL_TODAY:
+            try:
+                backfill_today(runner, a.feed)
+            except Exception as ex:   # noqa: BLE001  (mieux vaut démarrer sans rattrapage que pas du tout)
+                log.warning("rattrapage impossible (%s) : démarrage live sans historique du jour", ex)
+                runner.catchup_until = None
         try:
             asyncio.run(run_live(runner, a.feed))
         except KeyboardInterrupt:
