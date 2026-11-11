@@ -1,3 +1,5 @@
-   *.xlsx
-   .env
-   __pycache__/
+*.xlsx
+.env
+__pycache__/
+live_refs.json
+history/*.jsonl
