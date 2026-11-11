@@ -11,13 +11,22 @@
 Principes
   * 1 instance d'Engine par jour NY (créée à minuit NY, bougies de 00:00 à 23:55, comme le classeur).
   * Une bougie de 5 min n'est émise qu'une fois close (+ GRACE s) : aucune donnée future dans le calcul.
+  * Horodatages en NANOSECONDES entières (int), comme le script Excel (int64 ns) : les durées d'affichage
+    des états du carnet (BE / BJ / BN) et la règle du milieu sont alors identiques au centième de ns.
   * Références D / E / F par tranche horaire (médiane sur l'historique, comme l'Excel v7/v9) via refs.py :
     history/*.json (jours Excel) + live_refs.json (jours accumulés par le bot). Sur Railway, monter un
     volume et mettre REFS_FILE=/data/live_refs.json pour conserver les jours live entre redéploiements.
-  * Sens des trades : règle du milieu (bid/ask) comme le script Excel, tick rule en secours.
-  * ISO (colonne M, déclencheur du Mode 2) : trades avec condition « F » du stream, direction bid/ask
-    (sans la détection de sweep du script Excel : légère différence possible sur M).
-  * Colonnes non calculables depuis le tape (AS, CE, CF, BB, BD, BE, BJ, BN) : absentes -> défauts du moteur.
+  * FIDÉLITÉ TOTALE au script Excel (alpaca_excel_BTC_ETF_confluence_24h.py) :
+      - sens des trades : règle du milieu (bid/ask BRUT, comme classify), tick rule en secours ;
+      - ISO : condition « F » ; AT = (ISO acheteur − ISO vendeur) ÷ volume TOTAL de la bougie (sens = milieu) ;
+        CE / CF = volumes ISO à direction CERTAINE (règle bid/ask sur la dernière cotation STRICTEMENT
+        antérieure + détection de sweep <= 100 ms sur >= 3 niveaux ; contradiction ou non régulier -> 0) ;
+      - carnet dynamique : BB (qualité du spread), BD (rotation des tailles), BE (déséquilibre pondéré
+        temps), BJ (persistance), BN (déséquilibre x persistance) reconstruits ÉTAT PAR ÉTAT, durées
+        plafonnées à 300 s, médianes causales sur les 12 bougies précédentes (_book_metrics / _book_metrics_v3) ;
+      - état remis à zéro à chaque jour NY (le script traite une journée à la fois).
+    Seule approximation : une rafale ISO qui franchit la fin d'une bougie est figée avec sa direction
+    connue à la clôture (le script, en batch, connaît la rafale complète). Sans effet sur D..M, O, P.
 """
 from __future__ import annotations
 
@@ -27,7 +36,9 @@ import json
 import logging
 import os
 import re
+import statistics
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,12 +49,23 @@ from refs import BAR_MINUTES, SLOTS, RefBook
 
 NY = ZoneInfo("America/New_York")
 BAR = BAR_MINUTES * 60         # secondes
-GRACE = 2.0                    # attente (s) après la fin d'une bougie pour les trades en retard
+NS = 1_000_000_000
+BAR_NS = BAR * NS              # durée d'une bougie en nanosecondes
+GRACE_NS = 2 * NS              # attente après la fin d'une bougie pour les trades en retard
 HIST_DIR = Path("history")
 log = logging.getLogger("live")
 
 # conditions de trade « non régulières » (comme le script Excel) : jamais classées « certaines »
 NON_REGULAR_CONDS = {"B", "C", "N", "R", "V", "W", "Z", "U", "4", "P", "M", "Q"}
+
+# constantes des indicateurs carnet (identiques au script Excel)
+SWEEP_GAP_NS = 100_000_000     # SWEEP_GAP_MS = 100 : trades ISO séparés de moins de 100 ms = même rafale
+SWEEP_MIN_LEVELS = 3           # un sweep traverse au moins 3 niveaux de prix distincts
+BOOK_QUALITY_WINDOW = 12       # BB : médiane du spread moyen sur 12 bougies (bougie courante exclue)
+BOOK_MIN_HISTORY = 3           # BB : nb minimum de bougies d'historique avec spread valide
+TW_CAP_NS = 300 * NS           # durée retenue max pour un même état du carnet (5 min)
+REF_WINDOW_NS = 12 * BAR_NS    # BJ/BN : médiane des durées d'état sur 12 bougies (courante exclue)
+REF_MIN_STATES = 20            # BJ/BN : nb minimum d'états dans la fenêtre pour une médiane
 
 try:                           # hook optionnel (machine à états + Telegram)
     import alerts  # type: ignore
@@ -57,22 +79,34 @@ except Exception:              # noqa: BLE001
 
 
 # ------------------------------------------------------------------------------------------------ utilitaires
-_FRAC = re.compile(r"(\.\d{6})\d+")
+_TS_RE = re.compile(r"^([^.]+)(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})$")
 
 
-def parse_ts(s: str) -> float:
-    """RFC3339 Alpaca (nanosecondes, 'Z') -> epoch secondes."""
-    s = _FRAC.sub(r"\1", s.replace("Z", "+00:00"))
-    return datetime.fromisoformat(s).timestamp()
+def parse_ts(s: str) -> int:
+    """RFC3339 Alpaca (nanosecondes, 'Z') -> epoch NANOSECONDES (int exact, comme le script Excel)."""
+    m = _TS_RE.match(s)
+    frac = (m.group(2) or "").ljust(9, "0")[:9]
+    dt = datetime.fromisoformat(m.group(1) + ("+00:00" if m.group(3) == "Z" else m.group(3)))
+    return int(dt.timestamp()) * NS + int(frac or 0)
 
 
-def bucket_of(ts: float) -> int:
-    return int(ts // BAR) * BAR
+def _dt_ns(ts: int) -> datetime:
+    """epoch ns -> datetime NY exacte (pas de float)."""
+    return datetime.fromtimestamp(ts // NS, NY).replace(microsecond=(ts % NS) // 1000)
 
 
-def ny_midnight(ts: float) -> int:
-    d = datetime.fromtimestamp(ts, NY)
-    return int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp())
+def _iso_ms(ts: int) -> str:
+    """epoch ns -> ISO 8601 à la milliseconde (troncature), pour l'API historique Alpaca."""
+    return _dt_ns(ts).isoformat(timespec="milliseconds")
+
+
+def bucket_of(ts: int) -> int:
+    return (ts // BAR_NS) * BAR_NS
+
+
+def ny_midnight(ts: int) -> int:
+    d = _dt_ns(ts)
+    return int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp()) * NS
 
 
 def _conds(c) -> set:
@@ -89,30 +123,55 @@ def _conds(c) -> set:
 # ------------------------------------------------------------------------------------------------ agrégation 5 min
 def _blank():
     return dict(hi=None, lo=None, last=None, vol=0.0, n=0, pv=0.0, buy=0.0, sell=0.0,
-                bs=0.0, bn=0, as_=0.0, an=0, qn=0, iso_v=0.0, iso_d=0.0,
+                bs=0.0, bn=0, as_=0.0, an=0, qn=0, spr=0.0,
+                iso_v=0.0, iso_b=0.0, iso_s=0.0, ce=0.0, cf=0.0,
+                rot_min=None, rot_max=None, rot_n=0, seg=[],
                 cq=0.0, cr=0.0, cu=0.0, cv=0.0)
 
 
 class Agg:
-    """Agrège trades/quotes d'une bougie. Sens des trades : règle du milieu (comme le script Excel),
-    tick rule en secours. ISO : condition « F », direction certaine bid/ask (prix >= ask / <= bid)."""
+    """Agrège trades/quotes d'une bougie de 5 min — réplique exacte des feuilles ETF du script Excel.
+
+    États du carnet : chaque quote ouvre un état (affiché jusqu'à la quote suivante). Segments de la
+    bougie = état affiché au début + tous les états ouverts dans la bougie, durée = vie dans la bougie,
+    âge = vie depuis l'apparition (plafonnés à 300 s), en ns entières — exactement comme
+    _book_metrics / _book_metrics_v3 (qui travaillent en int64 ns).
+    """
 
     def __init__(self, etfs):
         self.etfs = list(etfs)
-        self.px = {}           # dernier prix (persiste d'une bougie / d'un jour à l'autre)
-        self.sg = {}           # dernier signe non nul (tick rule)
-        self.q = {}            # dernière quote (bid, ask) par ETF
+        self.bucket = None                       # début (epoch ns) de la bougie en cours, posé par le Runner
         self.cur = {e: _blank() for e in self.etfs}
+        self.reset_day()
 
-    def trade(self, sym, p, sz, cond=()):
+    def reset_day(self):
+        """État par ETF valable UNE journée (le script Excel traite un jour à la fois : tick rule,
+        fenêtres de médianes et états du carnet ne traversent pas minuit). La bougie en cours (cur)
+        n'est PAS touchée : le reset est piloté par le Runner dès que la bougie courante change de jour."""
+        self.px = {}           # dernier prix du jour (tick rule)
+        self.sg = {}           # dernier signe non nul (ffill de la tick rule)
+        self.qcur = {}         # etf -> (ts, bp, ap, bs, as) dernière quote du jour
+        self.qpre = {}         # etf -> dernière quote d'instant STRICTEMENT antérieur à qcur
+        self.st = {}           # etf -> (ts début, bid_size, ask_size) état carnet affiché
+        self.hist = {e: deque() for e in self.etfs}     # (début, fin) des états terminés (médianes BJ/BN)
+        self.spr_hist = {e: [] for e in self.etfs}      # spread_avg des bougies closes (médiane BB)
+        self.grp = {}          # etf -> rafale ISO en cours (sweep)
+
+    # ---- trades
+    def trade(self, sym, ts, p, sz, cond=()):
         c = self.cur.get(sym)
         if c is None or not sz or sz <= 0:
             return
-        q = self.q.get(sym)
+        # classify() : dernière quote à ts <= trade (égalité incluse), SANS filtre de validité
+        qi = self.qcur.get(sym)
+        if qi is not None and qi[0] > ts:
+            qi = self.qpre.get(sym)
+        if qi is not None and qi[0] > ts:
+            qi = None
         prev = self.px.get(sym)
         tick = 0 if prev is None else (1 if p > prev else -1 if p < prev else self.sg.get(sym, 0))
-        if q and q[0] > 0 and q[1] > q[0]:
-            mid = (q[0] + q[1]) / 2
+        if qi is not None:
+            mid = (qi[1] + qi[2]) / 2
             s = 1 if p > mid else (-1 if p < mid else tick)     # règle du milieu, tick rule en secours
         else:
             s = tick
@@ -136,46 +195,185 @@ class Agg:
             c["cv"] += sz
             c["cr"] += s * sz
         conds = _conds(cond)
-        if "F" in conds and not (conds & NON_REGULAR_CONDS):    # trade ISO « régulier » -> colonne M (delta ISO)
-            d = 0
-            if q and q[0] > 0 and q[1] > q[0]:
-                d = 1 if p >= q[1] else (-1 if p <= q[0] else 0)
+        if "F" in conds:                          # trade ISO (script : AUCUN filtre « régulier » pour AS/AT)
             c["iso_v"] += sz
-            c["iso_d"] += d * sz
+            if s > 0:                             # sens = règle du milieu (colonne AT : ÷ volume TOTAL)
+                c["iso_b"] += sz
+            elif s < 0:
+                c["iso_s"] += sz
+            # direction « certaine » (_sure_direction) : bid/ask de la dernière quote STRICTEMENT avant
+            qs = self.qcur.get(sym)
+            if qs is not None and qs[0] >= ts:
+                qs = self.qpre.get(sym)
+            if qs is not None and qs[0] >= ts:
+                qs = None
+            ba = 0
+            if qs is not None:
+                bp, ap = qs[1], qs[2]
+                if bp > 0 and ap > bp:            # marché locked / croisé : non classé
+                    ba = 1 if p >= ap else (-1 if p <= bp else 0)
+            # rafale (sweep) : trades ISO à moins de 100 ms ; la rafale inclut aussi les non réguliers
+            g = self.grp.get(sym)
+            if g is None or ts - g["ts"] > SWEEP_GAP_NS:
+                if g is not None:
+                    self._fin_grp(sym)            # rafale terminée : direction définitive
+                g = {"first": p, "last": p, "dmin": None, "dmax": None, "px": {p}, "ts": ts, "pend": []}
+                self.grp[sym] = g
+            else:
+                d = p - g["last"]
+                g["dmin"] = d if g["dmin"] is None else min(g["dmin"], d)
+                g["dmax"] = d if g["dmax"] is None else max(g["dmax"], d)
+                g["px"].add(p)
+                g["last"] = p
+                g["ts"] = ts
+            if not (conds & NON_REGULAR_CONDS):   # non régulier : dans la rafale, mais jamais « certain »
+                g["pend"].append((ba, sz))
 
-    def quote(self, sym, bs, as_, bp=1, ap=1):
+    # ---- quotes
+    def quote(self, sym, ts, bs, as_, bp=1, ap=1):
         c = self.cur.get(sym)
         if c is None:
             return
-        if bp and ap and bp > 0 and ap > bp:
-            self.q[sym] = (bp, ap)
-        c["bs"] += bs
+        qc = self.qcur.get(sym)
+        if qc is None or ts > qc[0]:
+            self.qpre[sym] = qc                   # dernière quote d'instant strictement antérieur
+            self.qcur[sym] = (ts, bp, ap, bs, as_)
+        else:                                     # même instant (rafale) : la dernière compte, qpre inchangé
+            self.qcur[sym] = (ts, bp, ap, bs, as_)
+        prev = self.st.get(sym)                   # l'état précédent cesse d'être affiché à ts
+        if prev is not None:
+            self.hist[sym].append((prev[0], ts))
+            dur = ts - max(prev[0], self.bucket)  # vie de l'état DANS la bougie (ns)
+            if dur > 0:
+                tot = prev[1] + prev[2]
+                imb = (prev[1] - prev[2]) / tot if tot > 0 else None
+                c["seg"].append((min(dur, TW_CAP_NS), min(ts - prev[0], TW_CAP_NS), imb))
+        self.st[sym] = (ts, bs, as_)
+        c["bs"] += bs                             # moyennes Y / Z (toutes les quotes, comme le script)
         c["bn"] += 1
         c["as_"] += as_
         c["an"] += 1
-        c["qn"] += 1                               # nb de mises à jour de quote -> churn (colonne BC)
+        c["qn"] += 1                              # nb de mises à jour -> churn (colonne BC)
+        c["spr"] += ap - bp                       # spread moyen (colonne AA des feuilles -> BB)
+        tot = bs + as_
+        if tot > 0:                               # BD : rotation des tailles affichées (quotes de la bougie)
+            c["rot_min"] = tot if c["rot_min"] is None else min(c["rot_min"], tot)
+            c["rot_max"] = tot if c["rot_max"] is None else max(c["rot_max"], tot)
+            c["rot_n"] += 1
 
-    def finalize(self):
-        """-> dict des clés de colonnes attendues par Engine.push ; remet les compteurs à zéro.
-        BA est posée ensuite par le Runner (référence par tranche, refs.py)."""
+    # ---- rafales ISO (sweeps)
+    @staticmethod
+    def _grp_dir(g):
+        """Direction de la rafale (script _sure_direction) : >= 3 prix distincts, variation monotone."""
+        if len(g["px"]) < SWEEP_MIN_LEVELS or g["dmin"] is None:
+            return 0
+        if g["dmin"] >= 0 and g["last"] > g["first"]:
+            return 1
+        if g["dmax"] <= 0 and g["last"] < g["first"]:
+            return -1
+        return 0
+
+    def _fin_grp(self, sym):
+        """Cumule les volumes « certains » (CE / CF) des trades de la rafale en attente, avec la
+        direction courante de la rafale. Appelé quand la rafale se termine (direction définitive)
+        ou à la clôture de la bougie (direction connue à cet instant — seule approximation du live)."""
+        g = self.grp.get(sym)
+        if not g or not g["pend"]:
+            return
+        sw = self._grp_dir(g)
+        c = self.cur[sym]
+        for ba, sz in g["pend"]:
+            sure = 0 if (ba and sw and ba != sw) else (ba if ba else sw)   # contradiction -> 0
+            if sure > 0:
+                c["ce"] += sz
+            elif sure < 0:
+                c["cf"] += sz
+        g["pend"] = []
+
+    # ---- clôture de bougie
+    def finalize(self, b):
+        """Clôt la bougie [b, b+BAR_NS) -> dict des clés attendues par Engine.push ; remet les compteurs
+        à zéro. BA est posée ensuite par le Runner (référence par tranche, refs.py)."""
+        s, e = b, b + BAR_NS
         bars = {}
-        for e in self.etfs:
-            c = self.cur[e]
+        for etf in self.etfs:
+            c = self.cur[etf]
+            self._fin_grp(etf)                    # rafale ISO encore ouverte : figée à la clôture
+            stt = self.st.get(etf)                # l'état affiché à la clôture participe à la bougie
+            if stt is not None:
+                dur = e - max(stt[0], s)
+                if dur > 0:
+                    tot = stt[1] + stt[2]
+                    imb = (stt[1] - stt[2]) / tot if tot > 0 else None
+                    c["seg"].append((min(dur, TW_CAP_NS), min(e - stt[0], TW_CAP_NS), imb))
+            # BE : déséquilibre du carnet pondéré par la durée d'affichage
+            num = den = 0
+            ages = []
+            segs = [sg for sg in c["seg"] if sg[2] is not None]
+            for dur, age, imb in segs:
+                num += imb * dur                  # dur : int ns -> produit float identique au script
+                den += dur
+                if age > 0:
+                    ages.append(age)
+            be = num / den if den > 0 else None
+            # BJ / BN : persistance = min(1, âge ÷ médiane des durées d'état des 12 bougies précédentes)
+            ws = s - REF_WINDOW_NS
+            ds = []
+            for t0, t1 in self.hist[etf]:
+                if t0 >= s:
+                    break                         # deque chronologique
+                if t0 >= ws:
+                    ds.append(min(min(t1, s) - t0, TW_CAP_NS))
+            if stt is not None and ws <= stt[0] < s:
+                ds.append(min(s - stt[0], TW_CAP_NS))
+            ref = None
+            if len(ds) >= REF_MIN_STATES:
+                dpos = [d for d in ds if d > 0]
+                if len(dpos) >= REF_MIN_STATES:
+                    ref = statistics.median(dpos)
+            if not (ref is not None and ref > 0) and len(ages) >= 3:   # repli : médiane des âges de la bougie
+                ref = statistics.median(ages)
+            bj = bn = None
+            if ref is not None and ref > 0 and segs:
+                pers = [min(1.0, age / ref) for _dur, age, _imb in segs]
+                bj = sum(pers) / len(pers)        # par comptage d'états (script : np.mean)
+                wnum = wden = 0.0
+                for (dur, _age, imb), ps in zip(segs, pers):
+                    if ps > 0:
+                        wnum += imb * dur * ps
+                        wden += dur * ps
+                bn = wnum / wden if wden > 0 else None
+            # BB : médiane mobile du spread moyen (12 bougies précédentes) ÷ spread de la bougie
+            spr = c["spr"] / c["qn"] if c["qn"] else None
+            hist = [x for x in self.spr_hist[etf][-BOOK_QUALITY_WINDOW:] if x is not None and x > 0]
+            bb = min(1.0, statistics.median(hist) / spr) if spr is not None and spr > 0 \
+                and len(hist) >= BOOK_MIN_HISTORY else None
+            self.spr_hist[etf].append(spr)
+            # BD : rotation des tailles affichées
+            bd = c["rot_max"] / c["rot_min"] if c["rot_n"] >= 2 else None
+            # nettoyage de la fenêtre des états (12 bougies de la PROCHAINE bougie au plus loin)
+            wn = s + BAR_NS - REF_WINDOW_NS
+            h = self.hist[etf]
+            while h and h[0][0] < wn:
+                h.popleft()
             has = c["n"] > 0
-            bars[e] = {
+            bars[etf] = {
                 "F": c["hi"], "G": c["lo"],
-                "H": c["last"] if has else self.px.get(e),     # clôture reportée sur bougie vide
+                "H": c["last"] if has else None,   # clôture VIDE sur bougie vide (comme l'Excel)
                 "I": c["vol"], "J": float(c["n"]),
                 "K": c["pv"] / c["vol"] if has and c["vol"] > 0 else None,
                 "L": c["buy"], "M": c["sell"],
                 "Y": c["bs"] / c["bn"] if c["bn"] else None,
                 "Z": c["as_"] / c["an"] if c["an"] else None,
-                "BC": c["qn"] / BAR_MINUTES,                   # churn live (quotes / minute)
-                "AT": c["iso_d"] / c["iso_v"] if c["iso_v"] > 0 else None,
+                "BB": bb, "BD": bd, "BE": be, "BJ": bj, "BN": bn,
+                "BC": c["qn"] / BAR_MINUTES,                   # churn (quotes / minute)
+                "AS": c["iso_v"] / c["vol"] if c["vol"] > 0 else None,
+                "AT": (c["iso_b"] - c["iso_s"]) / c["vol"] if c["vol"] > 0 else None,
+                "CE": c["ce"], "CF": c["cf"],
                 "QN": c["qn"],                                 # interne (accumulation des références)
                 "CQ": c["cq"], "CR": c["cr"], "CU": c["cu"], "CV": c["cv"],
             }
-        self.cur = {e: _blank() for e in self.etfs}
+        self.cur = {e2: _blank() for e2 in self.etfs}
         return bars
 
 
@@ -186,7 +384,7 @@ class Runner:
         self.refbook = refbook or RefBook()
         self.f_excl_cli = set(f_excluded) if f_excluded else None
         self.write_history = write_history
-        self.bucket = None        # début de la bougie en cours
+        self.bucket = None        # début de la bougie en cours (epoch ns)
         self.first = None         # première bougie « réelle » (avant : rattrapage depuis minuit, sans alertes)
         self.catchup_until = None # posé par backfill_today : tout ce qui est rejoué reste « catchup »
         self.day = None
@@ -196,6 +394,7 @@ class Runner:
         self.eq_syms = [set() for _ in range(SLOTS)]
         self.er = [None] * SLOTS  # réf. tape agrégée par slot (colonne ER)
         self.late = 0
+        self._agg_day = None      # jour NY de l'état de l'agrégateur (reset à minuit)
         self.hooks = []           # fn(bucket, bars, out) (tests)
 
     # ---- entrées
@@ -205,21 +404,21 @@ class Runner:
         if b < self.bucket:
             self.late += 1
             return
-        self.agg.trade(sym, p, sz, cond)
+        self.agg.trade(sym, ts, p, sz, cond)
 
     def on_quote(self, sym, ts, bs, as_, bp=1, ap=1):
         b = bucket_of(ts)
         self._advance(b)
         if b < self.bucket:
             return
-        self.agg.quote(sym, bs, as_, bp, ap)
+        self.agg.quote(sym, ts, bs, as_, bp, ap)
 
-    def tick(self, now):                 # appelé chaque seconde en live
+    def tick(self, now):                 # appelé chaque seconde en live (now en secondes)
         if self.bucket is not None:
-            self._advance(bucket_of(now - GRACE))
+            self._advance(bucket_of(int(now * NS) - GRACE_NS))
 
     def flush(self, ts):                 # ferme la bougie contenant ts (fin de replay / arrêt)
-        self._advance(bucket_of(ts) + BAR)
+        self._advance(bucket_of(ts) + BAR_NS)
         self.refbook.save()
 
     # ---- interne
@@ -229,7 +428,12 @@ class Runner:
             self.bucket = ny_midnight(target)
         while self.bucket < target:
             self._close(self.bucket)
-            self.bucket += BAR
+            self.bucket += BAR_NS
+            day = _dt_ns(self.bucket).date().isoformat()
+            if day != self._agg_day:     # minuit NY : l'état carnet/prix ne traverse pas les jours
+                self.agg.reset_day()     # (le script Excel traite une journée à la fois) — AVANT tout
+                self._agg_day = day      # événement ou clôture de bougie du nouveau jour
+        self.agg.bucket = self.bucket
 
     def _new_day(self, day):
         self.refbook.start_day(day)
@@ -255,13 +459,13 @@ class Runner:
         log.info("jour %s : réfs %d ETF, f_excluded=%s", day, len(base), sorted(excl))
 
     def _close(self, b):
-        dt = datetime.fromtimestamp(b, NY)
+        dt = _dt_ns(b)
         day = dt.date().isoformat()
         if day != self.day:
             self._new_day(day)
         minutes = dt.hour * 60 + dt.minute
         slot = minutes // BAR_MINUTES
-        bars = self.agg.finalize()
+        bars = self.agg.finalize(b)
         for e in ETFS:
             v = self.ba.get(e)
             bars[e]["BA"] = v[slot] if v and slot < len(v) else None
@@ -399,35 +603,36 @@ def backfill_today(runner, feed):
     """Rejoue le jour en cours depuis minuit NY, puis des passes de rattrapage jusqu'au présent
     (le téléchargement de la 1re passe prend du temps : sans passes suivantes, les bougies couvrant
     ce délai resteraient vides). Les flux paginés des 12 ETF sont fusionnés par heapq.merge :
-    mémoire bornée (~1 page par flux) et ordre global chronologique respecté."""
+    mémoire bornée (~1 page par flux) et ordre global chronologique respecté. À timestamp égal,
+    la quote passe AVANT le trade (comme le merge_asof « égalité incluse » du script Excel)."""
     import heapq
     key, sec = os.environ["APCA_API_KEY_ID"], os.environ["APCA_API_SECRET_KEY"]
-    t0 = ny_midnight(time.time())
-    if time.time() - t0 < BAR:
+    t0 = ny_midnight(int(time.time() * NS))
+    if int(time.time() * NS) - t0 < BAR_NS:
         return                                    # journée qui vient de commencer : rien à rejouer
 
     start = t0
     for passe in range(1, 5):
-        end = time.time()
-        if end - start < 45:                      # moins de 45 s de trou : inutile de refaire une passe
+        end = int(time.time() * NS)
+        if end - start < 45 * NS:                 # moins de 45 s de trou : inutile de refaire une passe
             break
-        d0 = datetime.fromtimestamp(start, NY).isoformat(timespec="milliseconds")
-        t1 = datetime.fromtimestamp(end, NY).isoformat(timespec="milliseconds")
-
-        def trades(sym):
-            for m in _paged(f"/v2/stocks/{sym}/trades", d0, t1, feed, key, sec, "trades"):
-                yield (parse_ts(m["t"]), 0, sym, m)
+        d0 = _iso_ms(start)
+        t1 = _iso_ms(end)
 
         def quotes(sym):
             for m in _paged(f"/v2/stocks/{sym}/quotes", d0, t1, feed, key, sec, "quotes"):
+                yield (parse_ts(m["t"]), 0, sym, m)
+
+        def trades(sym):
+            for m in _paged(f"/v2/stocks/{sym}/trades", d0, t1, feed, key, sec, "trades"):
                 yield (parse_ts(m["t"]), 1, sym, m)
 
         runner.catchup_until = end                # rejoué = pas d'alerte, pas de record (double comptage)
-        streams = [g for sym in ETFS for g in (trades(sym), quotes(sym))]
+        streams = [g for sym in ETFS for g in (quotes(sym), trades(sym))]
         log.info("rattrapage (passe %d) : rejeu %s -> %s ...", passe, d0[:19], t1[:19])
         n = 0
-        for ts, kind, sym, m in heapq.merge(*streams, key=lambda e: e[0]):
-            if kind == 0:
+        for ts, kind, sym, m in heapq.merge(*streams, key=lambda e: (e[0], e[1])):
+            if kind == 1:
                 runner.on_trade(sym, ts, float(m["p"]), float(m["s"]), m.get("c"))
             else:
                 runner.on_quote(sym, ts, float(m.get("bs", 0)), float(m.get("as", 0)),
@@ -458,26 +663,27 @@ def run_selftest(runner, ref_path):
     et compare I et J bougie par bougie. Ne valide NI le sens (bid/ask) NI Y/Z : le JSON ne les contient pas."""
     ref = json.loads(Path(ref_path).read_text())
     d0 = datetime.strptime(Path(ref_path).stem.split("_")[0], "%Y%m%d").replace(tzinfo=NY)
-    base = d0.timestamp()
+    base = int(d0.timestamp()) * NS
     ev = []
     for e, rows in ref["etfs"].items():
         for k, (vol, _q, _x, n) in rows.items():
-            n, t0 = int(n), base + (int(k[:2]) * 60 + int(k[3:])) * 60
+            n, t0 = int(n), base + (int(k[:2]) * 60 + int(k[3:])) * 60 * NS
             if n <= 0:
                 continue
             sz, rem = divmod(int(vol), n)
             for j in range(n):
-                ev.append((t0 + (j + 0.5) * BAR / n, e, 100.0 + 0.01 * (j % 2), sz + (rem if j == n - 1 else 0)))
+                ev.append((t0 + int((j + 0.5) * BAR_NS / n), e, 100.0 + 0.01 * (j % 2),
+                           sz + (rem if j == n - 1 else 0)))
     ev.sort()
     got = {}
     runner.hooks.append(lambda b, bars, out: got.__setitem__(b, {e: (bars[e]["I"], bars[e]["J"]) for e in ETFS}))
     for ts, e, p, sz in ev:
         runner.on_trade(e, ts, p, sz)
-    runner.flush(base + 86399)
+    runner.flush(base + 86399 * NS)
     bad = tot = 0
     for e, rows in ref["etfs"].items():
         for k, (vol, _q, _x, n) in rows.items():
-            b = int(base + (int(k[:2]) * 60 + int(k[3:])) * 60)
+            b = base + (int(k[:2]) * 60 + int(k[3:])) * 60 * NS
             tot += 1
             if got.get(b, {}).get(e) != (float(vol), float(n)):
                 bad += 1
