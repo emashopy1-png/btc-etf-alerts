@@ -1,4 +1,4 @@
-"""Port Python des colonnes CONFLUENCE (D, E, F, G, H, I, J, K, L, M, P) du script alpaca_excel_BTC_ETF_confluence_24h.py.
+"""Port Python des colonnes CONFLUENCE (D, E, F, G, H, I, J, K, L, M, N, O, P) du script alpaca_excel_BTC_ETF_confluence_24h.py.
 
 Chaque fonction reproduit la formule Excel de la feuille CONFLUENCE_<flux> (formules lues dans le .xlsx, ligne par ligne).
 Règle d'or : la valeur de la bougie i n'utilise que les bougies <= i (aucune donnée future). Voir `check_no_lookahead.py`.
@@ -116,7 +116,7 @@ class Engine:
     """Calcule, bougie après bougie, les colonnes CONFLUENCE à partir des lignes des 12 feuilles ETF.
 
     Entrée de `push` : bars[sym] = dict avec les clés de colonnes de la feuille ETF
-        F, G, H, I, J, K, L, M, Y, Z, AT, BA, BB, BC, BD, BE, BJ, BN, CR, CV
+        F, G, H, I, J, K, L, M, Y, Z, AS, AT, BA, BB, BC, BD, BE, BJ, BN, CE, CF, CQ, CR, CU, CV
     (valeurs numériques ou None) et refs = {"EQ": réf. churn J-1 de la bougie, "ER": réf. tape de la bougie}.
     Les colonnes dérivées (O, AB, AF, AW, CL) sont recalculées ici, comme dans le classeur.
     `minutes_ny` = heure NY de début de la bougie, en minutes depuis minuit (sert à la porte de 9h30).
@@ -310,4 +310,13 @@ class Engine:
         cv = sum(n((bars.get(s) or {}).get("CV")) for s in E)
         cr = sum(n((bars.get(s) or {}).get("CR")) for s in E)
         out["P"] = None if cv == 0 else cr / cv
+
+        # ---------------- N : % volume ISO CERTAIN (Σ(CE+CF) / Σ(AS x volume)) ----------------
+        den_n = sum(n((bars.get(s) or {}).get("AS")) * n((bars.get(s) or {}).get("I")) for s in E)
+        out["N"] = None if den_n == 0 else sum(n((bars.get(s) or {}).get("CE")) + n((bars.get(s) or {}).get("CF")) for s in E) / den_n
+
+        # ---------------- O : delta % exécuté trades 500-2 000 actions (ΣCQ / ΣCU) ----------------
+        cu = sum(n((bars.get(s) or {}).get("CU")) for s in E)
+        cq = sum(n((bars.get(s) or {}).get("CQ")) for s in E)
+        out["O"] = None if cu == 0 else cq / cu
         return out
