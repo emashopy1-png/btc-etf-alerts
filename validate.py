@@ -12,8 +12,8 @@ from openpyxl.utils import column_index_from_string as CI, get_column_letter as 
 
 from engine import ERR, ETFS, Engine, is_num
 
-ETF_COLS = "F G H I J K L M Y Z AT BA BB BC BD BE BJ BN CR CV".split()
-TARGETS = {"D": "D", "E": "E", "F": "F", "G": "G", "H": "H", "I": "I", "J": "J", "K": "K", "L": "L", "M": "M", "P": "P"}
+ETF_COLS = "F G H I J K L M Y Z AS AT BA BB BC BD BE BJ BN CE CF CQ CR CU CV".split()
+TARGETS = {"D": "D", "E": "E", "F": "F", "G": "G", "H": "H", "I": "I", "J": "J", "K": "K", "L": "L", "M": "M", "N": "N", "O": "O", "P": "P"}
 FIRST, LAST = 2, 289          # lignes de données (288 bougies de 5 min)
 HELP = {  # colonnes d'aide de CONFLUENCE : (première colonne du bloc de 12 ETF, attribut du moteur)
     "JF": ("JF", "JF"), "KD": ("KD", "KD"), "KP": ("KP", "KP"), "WC": ("HD", "WC"),
