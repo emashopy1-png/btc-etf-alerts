@@ -15,7 +15,10 @@ import statistics
 from typing import Dict, List, Optional, Sequence
 
 ETFS = ["IBIT", "FBTC", "BITB", "ARKB", "BTCO", "EZBC", "BRRR", "HODL", "BTCW", "MSBT", "GBTC", "BTC"]
-F_EXCLUDED = {"BTCO", "BTCW"}      # la formule F (Speed of tape) n'additionne que 10 ETF : ni BTCO ni BTCW
+# F (Speed of tape) n'additionne que les ETF dont la réf. « normale » du tape (colonne CM) existe pour la journée.
+# La liste VARIE d'un jour à l'autre (10 nov : sans BTCO ni BTCW ; 9 nov : sans BTCO seulement). Elle est fixe sur toute la journée.
+# -> ne plus coder en dur : la passer à Engine(f_excluded=...) ou la déduire avec f_excluded_from_refs().
+F_EXCLUDED = {"BTCO", "BTCW"}      # valeur par défaut (journée du 10 nov) si rien n'est fourni
 BAR_MINUTES = 5                    # CL = trades / 5 dans les feuilles ETF
 
 # --- constantes lues dans les formules ---
@@ -34,6 +37,18 @@ CLIP_DELTA = 0.5                   # G : delta % / 0,5 borné à ±1
 TIME_GATE_MIN = 9 * 60 + 30        # I, J : vides avant 9h30 NY
 
 ERR = "#ERR"                       # erreur Excel (#VALUE!, #DIV/0!) : on la propage telle quelle
+
+
+def f_excluded_from_refs(tape_ref_by_etf: Dict[str, Sequence], etfs: Sequence[str] = ETFS) -> set:
+    """Déduit les ETF exclus de F : ceux dont la réf. tape (colonne CM de la feuille ETF) n'est jamais numérique > 0 sur la journée.
+    `tape_ref_by_etf[sym]` = liste des valeurs CM de l'ETF (ou une seule valeur)."""
+    out = set()
+    for s in etfs:
+        v = tape_ref_by_etf.get(s)
+        vals = v if isinstance(v, (list, tuple)) else [v]
+        if not any(is_num(x) and x > 0 for x in vals):
+            out.add(s)
+    return out
 
 
 def is_num(x) -> bool:
@@ -122,8 +137,9 @@ class Engine:
     `minutes_ny` = heure NY de début de la bougie, en minutes depuis minuit (sert à la porte de 9h30).
     """
 
-    def __init__(self, etfs: Sequence[str] = ETFS):
+    def __init__(self, etfs: Sequence[str] = ETFS, f_excluded: Optional[set] = None):
         self.etfs = list(etfs)
+        self.f_excluded = set(F_EXCLUDED if f_excluded is None else f_excluded)
         self.k = len(self.etfs)
         self.i = -1
         # séries par ETF (indexées par la bougie)
@@ -248,7 +264,7 @@ class Engine:
         if n(er) == 0:
             out["F"] = None
         else:
-            out["F"] = sum(cl[s] for s in E if s not in F_EXCLUDED) / er
+            out["F"] = sum(cl[s] for s in E if s not in self.f_excluded) / er
 
         # ---------------- G : delta aligné pondéré volume (clip à ±1 de delta/0,5) ----------------
         vol_w = sum(v0((bars.get(s) or {}).get("I")) for s in E if is_num(w[s]))
