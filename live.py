@@ -396,39 +396,47 @@ def _paged(path, d0, t1, feed, key, sec, field):
 
 
 def backfill_today(runner, feed):
-    """Rejoue le jour en cours depuis minuit NY. Les flux paginés des 12 ETF sont fusionnés par
-    heapq.merge : mémoire bornée (~1 page par flux) et ordre global chronologique respecté."""
+    """Rejoue le jour en cours depuis minuit NY, puis des passes de rattrapage jusqu'au présent
+    (le téléchargement de la 1re passe prend du temps : sans passes suivantes, les bougies couvrant
+    ce délai resteraient vides). Les flux paginés des 12 ETF sont fusionnés par heapq.merge :
+    mémoire bornée (~1 page par flux) et ordre global chronologique respecté."""
     import heapq
     key, sec = os.environ["APCA_API_KEY_ID"], os.environ["APCA_API_SECRET_KEY"]
-    now = time.time()
-    t0 = ny_midnight(now)
-    if now - t0 < BAR:
+    t0 = ny_midnight(time.time())
+    if time.time() - t0 < BAR:
         return                                    # journée qui vient de commencer : rien à rejouer
-    d0 = datetime.fromtimestamp(t0, NY).isoformat(timespec="milliseconds")
-    t1 = datetime.fromtimestamp(now, NY).isoformat(timespec="milliseconds")
 
-    def trades(sym):
-        for m in _paged(f"/v2/stocks/{sym}/trades", d0, t1, feed, key, sec, "trades"):
-            yield (parse_ts(m["t"]), 0, sym, m)
+    start = t0
+    for passe in range(1, 5):
+        end = time.time()
+        if end - start < 45:                      # moins de 45 s de trou : inutile de refaire une passe
+            break
+        d0 = datetime.fromtimestamp(start, NY).isoformat(timespec="milliseconds")
+        t1 = datetime.fromtimestamp(end, NY).isoformat(timespec="milliseconds")
 
-    def quotes(sym):
-        for m in _paged(f"/v2/stocks/{sym}/quotes", d0, t1, feed, key, sec, "quotes"):
-            yield (parse_ts(m["t"]), 1, sym, m)
+        def trades(sym):
+            for m in _paged(f"/v2/stocks/{sym}/trades", d0, t1, feed, key, sec, "trades"):
+                yield (parse_ts(m["t"]), 0, sym, m)
 
-    runner.catchup_until = now                    # rejoué = pas d'alerte, pas de record (double comptage)
-    streams = [g for sym in ETFS for g in (trades(sym), quotes(sym))]
-    log.info("rattrapage du jour : téléchargement et rejeu depuis minuit NY...")
-    n = 0
-    for ts, kind, sym, m in heapq.merge(*streams, key=lambda e: e[0]):
-        if kind == 0:
-            runner.on_trade(sym, ts, float(m["p"]), float(m["s"]), m.get("c"))
-        else:
-            runner.on_quote(sym, ts, float(m.get("bs", 0)), float(m.get("as", 0)),
-                            float(m.get("bp", 1)), float(m.get("ap", 1)))
-        n += 1
-        if n % 500000 == 0:
-            log.info("rattrapage : %d événements rejoués...", n)
-    log.info("rattrapage terminé : %d événements depuis minuit NY", n)
+        def quotes(sym):
+            for m in _paged(f"/v2/stocks/{sym}/quotes", d0, t1, feed, key, sec, "quotes"):
+                yield (parse_ts(m["t"]), 1, sym, m)
+
+        runner.catchup_until = end                # rejoué = pas d'alerte, pas de record (double comptage)
+        streams = [g for sym in ETFS for g in (trades(sym), quotes(sym))]
+        log.info("rattrapage (passe %d) : rejeu %s -> %s ...", passe, d0[:19], t1[:19])
+        n = 0
+        for ts, kind, sym, m in heapq.merge(*streams, key=lambda e: e[0]):
+            if kind == 0:
+                runner.on_trade(sym, ts, float(m["p"]), float(m["s"]), m.get("c"))
+            else:
+                runner.on_quote(sym, ts, float(m.get("bs", 0)), float(m.get("as", 0)),
+                                float(m.get("bp", 1)), float(m.get("ap", 1)))
+            n += 1
+            if n % 500000 == 0:
+                log.info("rattrapage : %d événements rejoués...", n)
+        log.info("rattrapage passe %d terminée : %d événements", passe, n)
+        start = end                               # passe suivante : seulement le trou créé par celle-ci
 
 
 # ------------------------------------------------------------------------------------------------ replay / selftest
