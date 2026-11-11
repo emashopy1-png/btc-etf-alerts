@@ -10,10 +10,17 @@ from collections import defaultdict
 import openpyxl
 from openpyxl.utils import column_index_from_string as CI, get_column_letter as L
 
-from engine import ERR, ETFS, Engine, is_num
+from engine import ERR, ETFS, Engine, is_num, f_excluded_from_refs
 
-ETF_COLS = "F G H I J K L M Y Z AS AT BA BB BC BD BE BJ BN CE CF CQ CR CU CV".split()
-TARGETS = {"D": "D", "E": "E", "F": "F", "G": "G", "H": "H", "I": "I", "J": "J", "K": "K", "L": "L", "M": "M", "N": "N", "O": "O", "P": "P"}
+ETF_COLS = "F G H I J K L M Y Z AT BA BB BC BD BE BJ BN CR CV".split()
+CM_COL = "CM"   # réf. tape de chaque ETF (sert à déduire la liste des ETF de F)
+
+
+def f_excluded_for(etf_sheets, first=2, last=289):
+    """ETF exclus de F pour la journée : ceux sans réf. tape (CM) numérique > 0."""
+    refs = {s: [clean(ws.cell(r, CI(CM_COL)).value) for r in range(first, last + 1)] for s, ws in etf_sheets.items()}
+    return f_excluded_from_refs(refs)
+TARGETS = {"D": "D", "E": "E", "F": "F", "G": "G", "H": "H", "I": "I", "J": "J", "K": "K", "L": "L", "M": "M", "P": "P"}
 FIRST, LAST = 2, 289          # lignes de données (288 bougies de 5 min)
 HELP = {  # colonnes d'aide de CONFLUENCE : (première colonne du bloc de 12 ETF, attribut du moteur)
     "JF": ("JF", "JF"), "KD": ("KD", "KD"), "KP": ("KP", "KP"), "WC": ("HD", "WC"),
@@ -51,7 +58,9 @@ def main(path, feed="IEX", tol=1e-9):
     conf = wb[f"CONFLUENCE_{feed}"]
     etf = {s: wb[f"{s}_{feed}"] for s in ETFS}
     cidx = {c: CI(c) for c in list(TARGETS) + ["C", "EQ", "ER", "GJ", "GK"]}
-    eng = Engine()
+    fx = f_excluded_for(etf)
+    print('ETF exclus de F (déduits de CM) :', sorted(fx))
+    eng = Engine(f_excluded=fx)
     mism = defaultdict(list)
     stats = defaultdict(lambda: [0, 0])      # colonne -> [comparées, identiques]
     help_cols = {name: [L(CI(first) + k) for k in range(12)] for name, (first, _) in HELP.items()}
