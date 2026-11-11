@@ -64,6 +64,7 @@ class Event:
     kind: str           # TRIGGER / ALERT / CANCEL / EXPIRE / REPLACED / IGNORED
     direction: str      # LONG / SHORT
     info: str = ""
+    out: Optional[dict] = None   # valeurs D..P de la bougie (détail du message Telegram)
 
 
 @dataclass
@@ -92,7 +93,7 @@ class AlertMachine:
             return ev
 
         def E(mode, kind, d, info=""):
-            ev.append(Event(bar_no, hh, mode, kind, self._dir(d), info))
+            ev.append(Event(bar_no, hh, mode, kind, self._dir(d), info, out))
 
         # ------------------------------------------------ Mode 1 : attente en cours
         if self.p1:
@@ -105,7 +106,7 @@ class AlertMachine:
                 j_ok = is_num(out.get("J")) and sgn(out["J"]) == p.d
                 p.left -= 1
                 if nd >= c["min_deltas"] and j_ok:
-                    E("M1", "ALERT", p.d, f"{nd} delta dans le sens, J={out['J']:+.3f} (déclencheur N°{p.trig_bar})")
+                    E("M1", "ALERT", p.d, f"déclencheur N°{p.trig_bar}")
                     self.p1 = None
                 elif p.left == 0:
                     E("M1", "EXPIRE", p.d, f"non confirmé ({nd} delta, J={out.get('J')}) (déclencheur N°{p.trig_bar})")
@@ -128,7 +129,7 @@ class AlertMachine:
             j_ok = is_num(out.get("J")) and p.d * out["J"] >= m2["j_min"]
             p.left -= 1
             if nd >= c["min_deltas"] and j_ok:
-                E("M2", "ALERT", p.d, f"{nd} delta dans le sens, J={out['J']:+.3f} (déclencheur N°{p.trig_bar})")
+                E("M2", "ALERT", p.d, f"déclencheur N°{p.trig_bar}")
                 self.p2 = None
             elif p.left == 0:
                 E("M2", "EXPIRE", p.d, f"non confirmé ({nd} delta, J={out.get('J')}) (déclencheur N°{p.trig_bar})")
@@ -152,10 +153,32 @@ _KIND_EMOJI = {"TRIGGER": "⏳", "ALERT": "🚨", "CANCEL": "✖️", "EXPIRE": 
                "REPLACED": "🔁", "IGNORED": "⏭️"}
 
 
+def _fmt(x, nd=2, sign=False) -> str:
+    if not is_num(x):
+        return "—"
+    return f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}"
+
+
 def format_event(e: Event) -> str:
     side = "🟢 LONG" if e.direction == "LONG" else "🔴 SHORT"
     head = f"{_KIND_EMOJI.get(e.kind, '')} {_KIND_FR.get(e.kind, e.kind)} {side} — Mode {e.mode[-1]} — {e.ny} NY (bougie {e.bar})"
-    return f"{head}\n{e.info}" if e.info else head
+    if e.kind != "ALERT" or not e.out:
+        return f"{head}\n{e.info}" if e.info else head
+    o, d = e.out, 1 if e.direction == "LONG" else -1
+    parts, nd = [], 0
+    for c in CONFIG["delta_cols"]:
+        v = o.get(c)
+        ok = is_num(v) and sgn(v) == d
+        nd += ok
+        parts.append(f"{c} {_fmt(v, 2, True)} {'✅' if ok else '❌'}")
+    lines = [head,
+             f"📊 Ratio volume (D) : {_fmt(o.get('D'))} | Ratio carnet (E) : {_fmt(o.get('E'))} | "
+             f"Speed of tape (F) : {_fmt(o.get('F'))}",
+             f"📈 CVD carnet (I) : {_fmt(o.get('I'), 3, True)} | CVD carnet prix (J) : {_fmt(o.get('J'), 3, True)}",
+             f"Deltas ({nd}/5 dans le sens) : " + "  ".join(parts)]
+    if e.info:
+        lines.append(f"({e.info})")
+    return "\n".join(lines)
 
 
 def send_telegram(text: str) -> None:
