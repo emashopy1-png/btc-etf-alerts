@@ -22,8 +22,10 @@ F_EXCLUDED = {"BTCO", "BTCW"}      # valeur par défaut (journée du 10 nov) si 
 BAR_MINUTES = 5                    # CL = trades / 5 dans les feuilles ETF
 
 # --- constantes lues dans les formules ---
-CVD_DECAY_I = 0.925875             # colonne I
-CVD_DECAY_J = 0.890899             # colonne J
+CVD_HALF_LIFE_I = 45               # colonne I : demi-vie en minutes
+CVD_HALF_LIFE_J = 30               # colonne J : demi-vie en minutes
+CVD_DECAY_I = 0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_I)   # = 0.925875 pour des bougies de 5 min
+CVD_DECAY_J = 0.5 ** (BAR_MINUTES / CVD_HALF_LIFE_J)   # = 0.890899 pour des bougies de 5 min
 WIN = 60                           # fenêtre glissante de 60 bougies (J, AW, JR)
 WC_CAP = 0.4                       # plafond de poids : 40 % (3 itérations, HP/HQ/HR)
 MIN_TRADES_WIN = 20                # KP : au moins 20 trades sur 60 bougies
@@ -134,6 +136,9 @@ class Engine:
         F, G, H, I, J, K, L, M, Y, Z, AS, AT, BA, BB, BC, BD, BE, BJ, BN, CE, CF, CQ, CR, CU, CV
     (valeurs numériques ou None) et refs = {"EQ": réf. churn J-1 de la bougie, "ER": réf. tape de la bougie}.
     Les colonnes dérivées (O, AB, AF, AW, CL) sont recalculées ici, comme dans le classeur.
+    Clé optionnelle : refs["EQ_SYMS"] = ensemble des ETF dont la réf. churn J-1 est valide (restreint le numérateur de E).
+    LIVE : une instance d'Engine = UNE journée NY. Créer une nouvelle instance à chaque nouveau jour (minuit NY) : l'état
+    (CVD, fenêtres de 60 bougies, poids) ne doit pas se propager d'un jour à l'autre et la mémoire reste bornée.
     `minutes_ny` = heure NY de début de la bougie, en minutes depuis minuit (sert à la porte de 9h30).
     """
 
@@ -211,7 +216,7 @@ class Engine:
                 if i >= 1:
                     prev = _nums(self.BD[s][max(0, i - BD_MED_WIN): i])
                     bd = b.get("BD")
-                    if is_num(bd) and len(prev) >= 3:
+                    if is_num(bd) and bd > 0 and len(prev) >= 3:
                         stab = min(1.0, statistics.median(prev) / bd)
                 pers = b.get("BJ") if is_num(b.get("BJ")) else 0.5
                 rel = (0.1 + 0.9 * max(0.0, min(1.0, (self.KD[s][i] - 0.5) / 0.15))) ** 2
@@ -255,7 +260,10 @@ class Engine:
             out["E"] = None
         else:
             try:
-                out["E"] = sum(v0((bars.get(s) or {}).get("BC")) for s in E) / eq
+                # refs["EQ_SYMS"] (optionnel) : ETF ayant une réf. churn J-1 valide ; absent -> tous les ETF (comportement historique)
+                eq_syms = refs.get("EQ_SYMS")
+                out["E"] = sum(v0((bars.get(s) or {}).get("BC")) for s in E
+                               if eq_syms is None or s in eq_syms) / eq
             except ValueError:
                 out["E"] = ERR
 
