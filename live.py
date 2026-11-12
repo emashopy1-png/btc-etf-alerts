@@ -35,8 +35,10 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import statistics
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -76,6 +78,99 @@ try:                           # exécution Bybit démo des alertes confirmées 
     import bybit_exec as executor  # type: ignore
 except Exception:              # noqa: BLE001
     executor = None
+
+
+# ------------------------------------------------------------------------------------------------ data Excel (montage hybride)
+# Le service Excel (alpaca_excel_BTC_ETF_confluence_24h.py en mode live) publie sur GitHub, à chaque clôture
+# de bougie, les valeurs recalculées du classeur. Ici, à chaque bougie close : on attend le JSON de CETTE
+# bougie, on remplace G, I, J, K, L, M, O, P (les colonnes qui dérivaient) par les valeurs de l'Excel, et on
+# garde D, E, F calculés par le bot comme avant. L'attente tourne dans UN thread dédié avec une file FIFO :
+# la boucle websocket n'est jamais bloquée et les bougies arrivent à la machine à alertes dans l'ordre.
+EXCEL_COLS = ("G", "I", "J", "K", "L", "M", "O", "P")
+_EXCEL_ON = False
+_EXCEL_URL = None
+_EXCEL_WAIT_S = int(os.environ.get("EXCEL_WAIT_S", "180"))   # attente max du JSON de la bougie (le service Excel met ~1-2 min)
+_EXCEL_POLL_S = float(os.environ.get("EXCEL_POLL_S", "5"))   # intervalle entre deux lectures du JSON
+_excel_q = None                                              # queue.Queue créée au démarrage live
+
+
+def _excel_feed_setup():
+    """Appelé au démarrage live (jamais en replay/selftest). Actif seulement si EXCEL_FEED=1 + URL disponible."""
+    global _EXCEL_ON, _EXCEL_URL, _excel_q
+    if os.environ.get("EXCEL_FEED", "0") != "1":
+        log.info("data Excel : désactivée (EXCEL_FEED != 1) — toutes les colonnes sont calculées par le bot.")
+        return
+    url = os.environ.get("EXCEL_JSON_URL", "").strip()
+    if not url:
+        repo = os.environ.get("GITHUB_REPO", "").strip()
+        branch = os.environ.get("GITHUB_BRANCH", "live-data").strip() or "live-data"
+        if repo:
+            url = f"https://raw.githubusercontent.com/{repo}/{branch}/live/confluence_derniere_bougie.json"
+    if not url:
+        log.warning("EXCEL_FEED=1 mais ni EXCEL_JSON_URL ni GITHUB_REPO : data Excel désactivée.")
+        return
+    _EXCEL_URL = url
+    _excel_q = queue.Queue()
+    threading.Thread(target=_excel_worker, daemon=True, name="excel-feed").start()
+    _EXCEL_ON = True
+    log.info("data Excel : ACTIVÉE (%s) — %s viennent de l'Excel ; attente max %ss.",
+             url, ", ".join(EXCEL_COLS), _EXCEL_WAIT_S)
+
+
+def _excel_fetch():
+    """Télécharge le JSON de la dernière bougie (paramètre anti-cache) -> dict ou None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{_EXCEL_URL}?t={time.time_ns()}", timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception:              # noqa: BLE001  (réseau, 404 avant le 1er tick du service Excel...)
+        return None
+
+
+def _excel_wait_for(ny_key: str):
+    """Attend le JSON de la bougie ny_key ('AAAA-MM-JJTHH:MM') -> payload, ou None (timeout / bougie dépassée)."""
+    t0 = time.time()
+    while time.time() - t0 < _EXCEL_WAIT_S:
+        p = _excel_fetch()
+        if p and p.get("day") == ny_key[:10]:
+            got = str(p.get("ny_iso", ""))[:16]
+            if got == ny_key:
+                return p
+            if got > ny_key:       # le service Excel a déjà publié une bougie plus récente : celle-ci n'existera pas
+                log.warning("data Excel : bougie %s sautée par le service (il est à %s) — valeurs du bot.", ny_key, got)
+                return None
+        time.sleep(_EXCEL_POLL_S)
+    log.warning("data Excel : pas de JSON pour %s après %ss — valeurs du bot utilisées pour cette bougie.",
+                ny_key, _EXCEL_WAIT_S)
+    return None
+
+
+def _excel_worker():
+    """Un seul thread : pour chaque bougie close, merge Excel puis alertes + exécution (ordre des bougies garanti)."""
+    while True:
+        dt, out, bars = _excel_q.get()
+        try:
+            p = _excel_wait_for(dt.isoformat()[:16])
+            if p and isinstance(p.get("values"), dict):
+                vals = p["values"]
+                for k in EXCEL_COLS:
+                    out[k] = vals.get(k)           # None = cellule vide dans l'Excel (c'est la valeur de référence)
+                log.info("%s : %s <- Excel (recalculées)", dt.strftime("%H:%M"), "+".join(EXCEL_COLS))
+            events = []
+            if alerts is not None:
+                try:
+                    events = alerts.on_bar(dt.isoformat(), out, bars) or []
+                except Exception as ex:   # noqa: BLE001
+                    log.warning("alerts.on_bar : %s", ex)
+            if events and executor is not None:
+                try:
+                    executor.on_events(events)
+                except Exception as ex:   # noqa: BLE001
+                    log.warning("bybit_exec.on_events : %s", ex)
+        except Exception as ex:           # noqa: BLE001  (ne jamais tuer le thread)
+            log.warning("excel worker : %s", ex)
+        finally:
+            _excel_q.task_done()
 
 
 # ------------------------------------------------------------------------------------------------ utilitaires
@@ -490,17 +585,20 @@ class Runner:
                 f.write(json.dumps(rec) + "\n")
         if not catchup:
             log.info("%s %s", dt.strftime("%H:%M"), {k: (round(v, 4) if is_num(v) else v) for k, v in out.items()})
-            events = []
-            if alerts is not None:
-                try:
-                    events = alerts.on_bar(dt.isoformat(), out, bars) or []
-                except Exception as ex:   # noqa: BLE001
-                    log.warning("alerts.on_bar : %s", ex)
-            if events and executor is not None:
-                try:
-                    executor.on_events(events)
-                except Exception as ex:   # noqa: BLE001
-                    log.warning("bybit_exec.on_events : %s", ex)
+            if _EXCEL_ON:
+                _excel_q.put((dt, out, bars))   # merge Excel + alertes + exécution dans le thread dédié
+            else:
+                events = []
+                if alerts is not None:
+                    try:
+                        events = alerts.on_bar(dt.isoformat(), out, bars) or []
+                    except Exception as ex:   # noqa: BLE001
+                        log.warning("alerts.on_bar : %s", ex)
+                if events and executor is not None:
+                    try:
+                        executor.on_events(events)
+                    except Exception as ex:   # noqa: BLE001
+                        log.warning("bybit_exec.on_events : %s", ex)
         for h in self.hooks:
             h(b, bars, out)
 
@@ -717,6 +815,7 @@ def main():
                 log.warning("rattrapage impossible (%s) : démarrage live sans historique du jour", ex)
                 runner.catchup_until = None
         try:
+            _excel_feed_setup()      # montage hybride : actif seulement si EXCEL_FEED=1 (voir variables Railway)
             asyncio.run(run_live(runner, a.feed))
         except KeyboardInterrupt:
             runner.refbook.save()
