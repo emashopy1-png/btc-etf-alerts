@@ -1,0 +1,4 @@
+# Configuration de build Railway : ajoute git (push de l'Excel vers GitHub)
+# et LibreOffice (recalcul fidèle des valeurs de l'Excel pour les alertes).
+[phases.setup]
+aptPkgs = ["git", "libreoffice-calc"]
