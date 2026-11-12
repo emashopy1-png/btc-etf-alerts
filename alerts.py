@@ -36,7 +36,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
-from engine import ERR, is_num
+try:
+    from engine import ERR, is_num
+except Exception:      # alerts.py doit aussi fonctionner sans engine.py (montage fusionné avec le script Excel)
+    ERR = None
+
+    def is_num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and x not in (float("inf"), float("-inf"))
 
 log = logging.getLogger("alerts")
 
