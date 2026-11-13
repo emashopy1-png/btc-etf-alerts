@@ -103,6 +103,8 @@ DEFAULT_DAY = "2026-10-23"               # journée traitée par défaut (AAAA-M
 # ---- Mode LIVE (python ...py live) : bougie par bougie, alertes + push GitHub ----
 LIVE_MODE = False                        # activé par l'argument « live » (ne pas modifier ici)
 LIVE_SETTLE_S = int(os.environ.get("LIVE_SETTLE_S", "45"))   # délai après la clôture de bougie avant calcul (laisse Alpaca stabiliser la donnée)
+LIVE_SESSION_ONLY = os.environ.get("LIVE_SESSION_ONLY", "1") == "1"   # 1 = ne calcule que la séance d'alerte 9h30-14h00 NY en live
+                                                                      # (grosse économie de RAM/coût : ~4,5 h de données au lieu de 24 h ; 0 = journée complète)
 LIVE_ALERTS = os.environ.get("LIVE_ALERTS", "0") == "1"      # montage hybride : les alertes restent sur le bot (il lit le JSON) ; 1 = le service Excel alerte lui-même
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()      # ex. "emashopy1-png/btc-etf-alerts" ; vide = pas de push
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()    # token GitHub (classic, droit « repo »)
@@ -299,7 +301,12 @@ def day_bounds(d):
 
 def session_window(day, feed):
     d = datetime.strptime(day, "%Y-%m-%d").date() if day else datetime.now(NY).date()
-    start, close = day_bounds(d)
+    if LIVE_MODE and LIVE_SESSION_ONLY:
+        # live allégé (plan gratuit) : uniquement la séance d'alerte 9h30 -> 14h05 NY (la bougie de 14h00 est incluse)
+        start = datetime(d.year, d.month, d.day, 9, 30, tzinfo=NY).astimezone(timezone.utc)
+        close = datetime(d.year, d.month, d.day, 14, 5, tzinfo=NY).astimezone(timezone.utc)
+    else:
+        start, close = day_bounds(d)
     now = datetime.now(timezone.utc)
     end = min(close, now)
     if feed == "SIP":
@@ -3641,6 +3648,21 @@ def _wait_next_tick():
     time.sleep(delay)
 
 
+def _sleep_until_session():
+    """Hors séance d'alerte (bougies 9h30-14h00 NY, jours de semaine) : dort jusqu'au prochain créneau utile.
+    Dors par tranches d'1 h max : le service reste réactif aux redémarrages Railway."""
+    now = datetime.now(NY)
+    target = now.replace(hour=9, minute=33, second=0, microsecond=0)   # réveil juste avant la 1re bougie utile (9h30)
+    if now >= target:
+        target += timedelta(days=1)
+    while target.weekday() >= 5:                                       # samedi / dimanche -> lundi
+        target += timedelta(days=1)
+    delay = max(60.0, (target - now).total_seconds())
+    print(f"Hors séance (calculs limités à 9h30-14h00 NY, lun-ven) : sommeil jusqu'à "
+          f"{target.strftime('%A %d/%m %H:%M')} NY ({delay / 3600:.1f} h).")
+    time.sleep(min(delay, 3600.0))
+
+
 def live_loop():
     """Mode live : à chaque clôture de bougie -> Excel à jour + alertes sur les valeurs recalculées + push GitHub.
     Une erreur (réseau, API...) est loguée puis la boucle reprend : service H24 sans supervision."""
@@ -3648,6 +3670,7 @@ def live_loop():
     LIVE_MODE = True
     print(f"MODE LIVE : tick toutes les {BAR_MINUTES} min (+{LIVE_SETTLE_S} s de stabilisation). "
           f"Alertes locales : {'activées' if LIVE_ALERTS else 'désactivées (le bot les gère via le JSON publié)'}. "
+          f"Fenêtre : {'séance 9h30-14h00 NY uniquement (mode allégé)' if LIVE_SESSION_ONLY else 'journée complète'}. "
           f"Historique : {HIST_DIR}")
     _client()          # vérifie les clés Alpaca au démarrage : si elles manquent, le service s'arrête tout de suite (visible dans les logs)
     _git_setup()
@@ -3656,11 +3679,21 @@ def live_loop():
         try:
             day = datetime.now(NY).date().isoformat()
             _wait_next_tick()
+            if LIVE_SESSION_ONLY:
+                now_ny = datetime.now(NY)
+                mins = now_ny.hour * 60 + now_ny.minute
+                # ticks utiles : 9h35 (bougie 9h30) -> 14h05/14h06 (bougie 14h00), jours de semaine uniquement
+                if now_ny.weekday() >= 5 or not (9 * 60 + 35 <= mins <= 14 * 60 + 6):
+                    _sleep_until_session()
+                    continue
             t0 = time.time()
             out, data = run_day(day, list(FEEDS))
             last_bar = None
-            if data:
-                feed0 = list(data)[0]
+            feed0 = list(data)[0] if data else None
+            del data                                   # libère la RAM AVANT le recalcul LibreOffice
+            import gc
+            gc.collect()                               # (plan gratuit = 1 Go : données + soffice ne doivent pas coexister)
+            if feed0:
                 res = _extract_last_bar_values(out, feed0, day)     # recalcul LibreOffice : une seule fois par tick
                 if res:
                     ny_iso, vals = res
