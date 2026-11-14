@@ -299,6 +299,17 @@ def day_bounds(d):
     return start, close
 
 
+def _ref_window(d):
+    """Fenêtre (UTC) de la journée de RÉFÉRENCE d (J-1 ou séances d'historique).
+    En live allégé, les bougies du jour couvrent la séance 9h30-14h05 NY : la référence doit couvrir la MÊME
+    fenêtre — sinon (a) on télécharge 24 h de données pour n'en utiliser que 4,5 h (pic mémoire -> crash), et
+    (b) les tranches seraient alignées par position (la bougie de 9h30 comparée à 00h00 J-1)."""
+    if LIVE_MODE and LIVE_SESSION_ONLY:
+        return (datetime(d.year, d.month, d.day, 9, 30, tzinfo=NY).astimezone(timezone.utc),
+                datetime(d.year, d.month, d.day, 14, 5, tzinfo=NY).astimezone(timezone.utc))
+    return day_bounds(d)
+
+
 def session_window(day, feed):
     d = datetime.strptime(day, "%Y-%m-%d").date() if day else datetime.now(NY).date()
     if LIVE_MODE and LIVE_SESSION_ONLY:
@@ -381,7 +392,7 @@ def prev_session_avg_volume_api(client, sym, day, feed, max_back=7):
         d = day - timedelta(days=k)
         if d.weekday() >= 5:
             continue
-        s, e = day_bounds(d)
+        s, e = _ref_window(d)
         tr = fetch_trades(client, sym, s, e, feed)
         if tr.empty:
             continue
@@ -468,7 +479,8 @@ def _read_hist_file(path, feed):
                 v = _hnum(r[iv])
                 ntd = _hnum(r[itd]) if (itd is not None and len(r) > itd) else np.nan
                 rows[lab] = (0.0 if np.isnan(v) else v, _hnum(r[ic]), _hnum(r[ii]), ntd)
-            if "15:55" in rows:                        # séance complète
+            done = "14:00" if (LIVE_MODE and LIVE_SESSION_ONLY) else "15:55"
+            if done in rows:                         # séance complète (en live allégé, la dernière bougie est 14h00)
                 out[sym] = rows
     finally:
         wb.close()
@@ -550,7 +562,7 @@ def _load_hist(day_date, feed):
 
 
 def _window_labels(day_date):
-    s, e = day_bounds(day_date)
+    s, e = _ref_window(day_date)
     idx = pd.date_range(s, e, freq=f"{BAR_MINUTES}min", inclusive="left")
     return [t.tz_convert(NY).strftime("%H:%M") for t in idx]
 
@@ -623,8 +635,19 @@ def prev_session_avg_volume(client, sym, day, feed, max_back=7):
         b = None
     if b is not None:
         return b["mean"], b["last"], b["slots"]
+    if LIVE_MODE:                                   # cache disque (Volume) : un redémarrage ne retélécharge pas J-1
+        rc = _refcache_load(sym, feed, str(day))
+        if rc and rc.get("vol_slots") and rc.get("ref_date"):
+            print(f"réf. volume J-1 ({sym}, {feed}) : cache disque du jour (pas de retéléchargement).")
+            return (rc.get("vol_mean"), datetime.strptime(rc["ref_date"], "%Y-%m-%d").date(),
+                    [np.nan if v is None else float(v) for v in rc["vol_slots"]])
     print(f"[!] {sym} ({feed}) : historique local insuffisant (< {HIST_MIN_DAYS} séances) -> repli sur J-1 téléchargé.")
-    return prev_session_avg_volume_api(client, sym, day, feed, max_back)
+    out = prev_session_avg_volume_api(client, sym, day, feed, max_back)
+    if LIVE_MODE and out[1] is not None:
+        _refcache_save(sym, feed, str(day), ref_date=str(out[1]),
+                       vol_mean=(float(out[0]) if out[0] is not None else None),
+                       vol_slots=_flist(out[2]))
+    return out
 
 
 # ----------------------------------------------------------------- enchères (optionnel)
@@ -1139,53 +1162,59 @@ def _churn_ref_series(quotes, start, end):
     return out
 
 
+def _apply_ref_slots(bars, slots):
+    """Applique les tranches de référence (fenêtre complète) aux bougies présentes : la bougie k reçoit la
+    tranche k (même heure NY) ; quand la séance avance, les nouvelles bougies piochent la suite du tableau."""
+    n = len(bars)
+    for col, arr in slots.items():
+        out = np.full(n, np.nan)
+        m = min(n, len(arr))
+        out[:m] = arr[:m]
+        bars[col] = out
+
+
 def _attach_book_ref(client, sym, feed, ref, bars):
-    """Colonne « réf. J-1 » du déséquilibre : médiane de J-1 sur la même tranche (+/- REF_SMOOTH bougies). Jamais bloquant."""
+    """Colonne « réf. J-1 » du déséquilibre : médiane de J-1 sur la même tranche (+/- REF_SMOOTH bougies). Jamais bloquant.
+    -> dict {colonne: tranches de la fenêtre de réf. COMPLÈTE} (mis en cache par l'appelant), ou None.
+    La fenêtre J-1 suit _ref_window : en live allégé, la séance seule — fini le téléchargement de 24 h de quotes
+    (plusieurs millions de lignes) qui faisait tuer le conteneur à chaque tick, et fini le décalage 9h30 vs 00h00."""
     try:
+        slots = None
         if BOOK_J1_BASELINE and len(bars):
             hb = _hist_baseline(sym, bars.index[0].tz_convert(NY).date(), feed)
             if hb is not None:                              # v7 : réf. déséquilibre + churn = médiane de l'historique local (aucun téléchargement)
-                n_ = len(bars)
-                a1 = np.full(n_, np.nan); a2 = np.full(n_, np.nan)
-                m1 = min(n_, len(hb["imb"])); a1[:m1] = hb["imb"][:m1]
-                m2 = min(n_, len(hb["churn"])); a2[:m2] = hb["churn"][:m2]
-                bars["imb_ref"], bars["churn_ref"] = a1, a2
-                a3 = np.full(n_, np.nan); m3 = min(n_, len(hb["imb_mad"])); a3[:m3] = hb["imb_mad"][:m3]
-                bars["imb_mad"] = a3
-                a4 = np.full(n_, np.nan); m4 = min(n_, len(hb["tape"])); a4[:m4] = hb["tape"][:m4]
-                bars["tape_ref"] = a4                       # v9 : réf. vitesse du tape (trades / min)
+                slots = {"imb_ref": np.asarray(hb["imb"], dtype=float),
+                         "churn_ref": np.asarray(hb["churn"], dtype=float),
+                         "imb_mad": np.asarray(hb["imb_mad"], dtype=float),
+                         "tape_ref": np.asarray(hb["tape"], dtype=float)}   # v9 : réf. vitesse du tape (trades / min)
                 print(f"réf. déséquilibre / churn ({sym}) : médiane de {hb['n']} séance(s) de l'historique local.")
-                return
-        if not BOOK_J1_BASELINE or not ref or ref[1] is None:
-            return
-        s, e = day_bounds(ref[1])
-        q = fetch_quotes(client, sym, s, e, feed)
-        if q.empty:
-            print(f"[!] {sym} ({feed}) : pas de quotes J-1 ({ref[1]}), réf. J-1 du déséquilibre vide.")
-            return
-        v = _imb_tw_series(q, s, e)
-        slots = np.full(len(v), np.nan)
-        for j in range(len(v)):
-            w = v[max(0, j - REF_SMOOTH): j + REF_SMOOTH + 1]
-            w = w[np.isfinite(w)]
-            if len(w):
-                slots[j] = float(np.median(w))
-        arr = np.full(len(bars), np.nan)
-        n = min(len(bars), len(slots))
-        arr[:n] = slots[:n]
-        bars["imb_ref"] = arr
-        # réf. J-1 du churn (sert au ratio churn de la feuille CONFLUENCE uniquement) : jamais bloquant
-        try:
-            cr = _churn_ref_series(q, s, e)
-            carr = np.full(len(bars), np.nan)
-            m_ = min(len(bars), len(cr))
-            carr[:m_] = cr[:m_]
-            bars["churn_ref"] = carr
-        except Exception as exc2:
-            print(f"[!] réf. J-1 du churn indisponible pour {sym} ({feed}) : {exc2}")
-        print(f"réf. J-1 du déséquilibre ({ref[1]}) : {int(np.isfinite(arr).sum())} tranche(s) renseignée(s).")
+        if slots is None:
+            if not BOOK_J1_BASELINE or not ref or ref[1] is None:
+                return None
+            s, e = _ref_window(ref[1])
+            q = fetch_quotes(client, sym, s, e, feed)
+            if q.empty:
+                print(f"[!] {sym} ({feed}) : pas de quotes J-1 ({ref[1]}), réf. J-1 du déséquilibre vide.")
+                return None
+            v = _imb_tw_series(q, s, e)
+            imb = np.full(len(v), np.nan)
+            for j in range(len(v)):
+                w = v[max(0, j - REF_SMOOTH): j + REF_SMOOTH + 1]
+                w = w[np.isfinite(w)]
+                if len(w):
+                    imb[j] = float(np.median(w))
+            slots = {"imb_ref": imb}
+            # réf. J-1 du churn (sert au ratio churn de la feuille CONFLUENCE uniquement) : jamais bloquant
+            try:
+                slots["churn_ref"] = _churn_ref_series(q, s, e)
+            except Exception as exc2:
+                print(f"[!] réf. J-1 du churn indisponible pour {sym} ({feed}) : {exc2}")
+            print(f"réf. J-1 du déséquilibre ({ref[1]}) : {int(np.isfinite(imb).sum())} tranche(s) renseignée(s).")
+        _apply_ref_slots(bars, slots)
+        return slots
     except Exception as exc:
         print(f"[!] réf. J-1 du déséquilibre indisponible pour {sym} ({feed}) : {exc}")
+        return None
 
 
 def build_bars(trades_cl, quotes, start, end):
@@ -3264,6 +3293,54 @@ _PREV_REF_CACHE = {}      # (sym, date, feed) -> référence volume J-1 (figée 
 _BOOK_REF_CACHE = {}      # (sym, feed, tag) -> {colonne: tableau numpy} réf. carnet J-1 (figée pour la journée)
 
 
+def _flist(arr):
+    """Tableau numpy -> liste JSON (NaN -> None)."""
+    return [None if not np.isfinite(v) else float(v) for v in arr]
+
+
+def _farr(lst):
+    """Liste JSON (None -> NaN) -> tableau numpy float."""
+    return np.array([np.nan if v is None else float(v) for v in lst], dtype=float)
+
+
+def _refcache_path(sym, feed):
+    return os.path.join(OUT_DIR, f"refcache_{sym}_{feed}.json")
+
+
+def _refcache_load(sym, feed, day_iso):
+    """Références J-1 déjà téléchargées AUJOURD'HUI (sur le Volume) : un redémarrage du conteneur ne
+    retélécharge plus rien. C'est ce cache qui casse la boucle crash -> perte des caches mémoire -> retéléchargement."""
+    try:
+        with open(_refcache_path(sym, feed), encoding="utf-8") as fh:
+            rc = json.load(fh)
+        if rc.get("day") == day_iso:
+            return rc
+    except Exception:
+        pass
+    return None
+
+
+def _refcache_save(sym, feed, day_iso, **fields):
+    """Ajoute des champs au cache disque des références du jour (lecture-modification-écriture, jamais bloquant)."""
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        p = _refcache_path(sym, feed)
+        rc = {}
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    rc = json.load(fh)
+            except Exception:
+                rc = {}
+        if rc.get("day") != day_iso:
+            rc = {"day": day_iso}
+        rc.update({k: v for k, v in fields.items() if v is not None})
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(rc, fh)
+    except Exception as exc:
+        print(f"[!] cache de références ({sym}, {feed}) non écrit : {exc}")
+
+
 def _read_cached_csv(path):
     try:
         df = pd.read_csv(path)
@@ -3301,23 +3378,34 @@ def _fetch_incremental(client, sym, start, end, feed, tag, kind):
     return out
 
 
-def _attach_book_ref_cached(client, sym, feed, ref, bars, tag):
-    """Live : la réf. carnet J-1 (colonnes imb_ref / churn_ref / imb_mad / tape_ref) est figée pour la journée :
-    calculée une fois, réappliquée à chaque tick (les créneaux de la journée ne changent pas)."""
+def _attach_book_ref_cached(client, sym, feed, ref, bars, tag, day_iso):
+    """Live : la réf. carnet J-1 (colonnes imb_ref / churn_ref / imb_mad / tape_ref) est figée pour la journée.
+    Le cache stocke la fenêtre de référence COMPLÈTE (mémoire + disque) : les bougies ajoutées au fil de la
+    séance reçoivent leur tranche — avant, le cache figeait la longueur du 1er tick et tout le reste du jour
+    restait vide. day_iso = jour analysé (AAAA-MM-JJ), clé du cache disque."""
     key = (sym, feed, tag)
     cached = _BOOK_REF_CACHE.get(key)
+    if cached is None and LIVE_MODE:
+        rc = _refcache_load(sym, feed, day_iso)
+        if rc and rc.get("imb"):
+            cached = {"imb_ref": _farr(rc["imb"])}
+            for col, fld in (("churn_ref", "churn"), ("imb_mad", "imb_mad"), ("tape_ref", "tape")):
+                if rc.get(fld):
+                    cached[col] = _farr(rc[fld])
+            _BOOK_REF_CACHE[key] = cached
+            print(f"réf. carnet ({sym}) : cache disque du jour (pas de retéléchargement).")
     if cached is not None:
-        n = len(bars)
-        for col, arr in cached.items():
-            out = np.full(n, np.nan)
-            m = min(n, len(arr))
-            out[:m] = arr[:m]
-            bars[col] = out
+        _apply_ref_slots(bars, cached)
         return
-    _attach_book_ref(client, sym, feed, ref, bars)
-    cols = [c for c in ("imb_ref", "churn_ref", "imb_mad", "tape_ref") if c in bars.columns]
-    if cols:
-        _BOOK_REF_CACHE[key] = {c: bars[c].to_numpy(dtype=float).copy() for c in cols}
+    slots = _attach_book_ref(client, sym, feed, ref, bars)
+    if slots:
+        _BOOK_REF_CACHE[key] = slots
+        if LIVE_MODE and "imb_ref" in slots:
+            _refcache_save(sym, feed, day_iso,
+                           imb=_flist(slots["imb_ref"]),
+                           churn=_flist(slots["churn_ref"]) if "churn_ref" in slots else None,
+                           imb_mad=_flist(slots["imb_mad"]) if "imb_mad" in slots else None,
+                           tape=_flist(slots["tape_ref"]) if "tape_ref" in slots else None)
 
 
 def collect_feed(client, feed, day, tag):
@@ -3368,7 +3456,10 @@ def collect_feed(client, feed, day, tag):
             cl = classify(trades, quotes)
             cl.to_csv(f"{OUT_DIR}/{sym}_{tag}_{feed}_trades_classified.csv.gz", index=False)
             bars_by_sym[sym] = build_bars(cl, quotes, pd.Timestamp(start), pd.Timestamp(end))
-            _attach_book_ref_cached(client, sym, feed, refs.get(sym), bars_by_sym[sym], tag)
+            _attach_book_ref_cached(client, sym, feed, refs.get(sym), bars_by_sym[sym], tag, str(day_date))
+            del trades, quotes, cl
+            import gc
+            gc.collect()                            # live : le pic mémoire redescend entre deux ETF (plan 1 Go)
         except Exception as exc:
             if sym == MANDATORY:
                 raise
@@ -3483,9 +3574,9 @@ def _last_bar_payload(ny_iso, feed, out):
 _GIT_OK = None
 
 
-def _git(*args, check=True):
+def _git(*args, check=True, timeout=180):
     import subprocess
-    return subprocess.run(["git", "-C", GIT_DIR, *args], capture_output=True, text=True, check=check)
+    return subprocess.run(["git", "-C", GIT_DIR, *args], capture_output=True, text=True, check=check, timeout=timeout)
 
 
 def _git_setup():
@@ -3504,7 +3595,7 @@ def _git_setup():
     try:
         if not os.path.isdir(os.path.join(GIT_DIR, ".git")):
             os.makedirs(os.path.dirname(GIT_DIR) or ".", exist_ok=True)
-            subprocess.run(["git", "clone", url, GIT_DIR], capture_output=True, text=True, check=True)
+            subprocess.run(["git", "clone", url, GIT_DIR], capture_output=True, text=True, check=True, timeout=600)
         remote = _git("ls-remote", "--heads", "origin", GITHUB_BRANCH).stdout.strip()
         if remote:
             _git("fetch", "origin", GITHUB_BRANCH)
@@ -3515,8 +3606,11 @@ def _git_setup():
         _git("config", "user.name", "Railway live")
         _GIT_OK = True
         print(f"Push GitHub actif : {GITHUB_REPO} (branche {GITHUB_BRANCH}).")
-    except subprocess.CalledProcessError as exc:
-        print(f"[!] GitHub injoignable au démarrage ({(exc.stderr or '').strip()[-200:]}) : nouvel essai à chaque tick.")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        err = exc.stderr
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        print(f"[!] GitHub injoignable au démarrage ({(err or str(exc)).strip()[-200:]}) : nouvel essai à chaque tick.")
     return _GIT_OK
 
 
@@ -3529,6 +3623,7 @@ def _git_commit_push(msg):
         _git("add", "-f", "-A")
         st = _git("status", "--porcelain").stdout.strip()
         if not st:
+            print("Push GitHub : rien de nouveau à publier ce tick.")
             return
         if _git("rev-parse", "--verify", "HEAD", check=False).returncode == 0:
             _git("commit", "--amend", "-m", msg)
@@ -3536,10 +3631,14 @@ def _git_commit_push(msg):
             _git("commit", "-m", msg)
         try:
             _git("push", "--force-with-lease", "origin", GITHUB_BRANCH)
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             _git("push", "--force", "origin", GITHUB_BRANCH)
-    except subprocess.CalledProcessError as exc:
-        print(f"[!] Push GitHub échoué ({(exc.stderr or '').strip()[-200:]}) : réessaie au prochain tick.")
+        print(f"Push GitHub : branche {GITHUB_BRANCH} mise à jour ({msg}).")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        err = exc.stderr
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        print(f"[!] Push GitHub échoué ({(err or str(exc)).strip()[-200:]}) : réessaie au prochain tick.")
 
 
 def _git_push_tick(xlsx_path, day, last_bar=None):
@@ -3698,6 +3797,7 @@ def live_loop():
                 if res:
                     ny_iso, vals = res
                     last_bar = (ny_iso, feed0, vals)
+                    print(f"Recalcul LibreOffice OK : valeurs de la bougie de {ny_iso[11:16]} NY prêtes pour le JSON.")
                     if LIVE_ALERTS:
                         _fire_alerts(ny_iso, vals)
             _git_push_tick(out, day, last_bar)
